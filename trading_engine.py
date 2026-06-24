@@ -189,7 +189,7 @@ class TradingEngine:
             consensus_score=result.score,
             agents_agree=result.agents_agree,
             regime=result.regime,
-            order_id=str(order.get("orderId", "")),
+            binance_order_id=str(order.get("orderId", "")),  # ← FIXED
         )
 
         msg = (f"✅ {result.action} {symbol} @ {price:.4f} "
