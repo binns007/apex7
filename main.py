@@ -10,6 +10,16 @@ Changes vs v1:
   - /api/trades exposes `notes` (used to flag a failed OCO exit — a
     position with no automatic TP/SL needs a human's attention).
   - clean shutdown of the shared aiohttp session in market_data.
+
+Changes vs v2:
+  - /api/trades now exposes `risk_usdt`, and for OPEN trades also
+    returns live `unrealized_pnl_usdt` / `unrealized_pnl_pct` computed
+    from current market price — previously an open trade showed no
+    PnL at all until it closed.
+  - /api/performance now returns `unrealized_pnl_usdt` (sum across all
+    open positions) and `combined_pnl_usdt` (realized + unrealized),
+    instead of only ever reporting closed-trade PnL. The dashboard
+    stat card was silently ignoring anything still open.
 """
 import asyncio
 import logging
@@ -76,7 +86,7 @@ async def lifespan(app: FastAPI):
     await market_data_shutdown()
 
 
-app = FastAPI(title="APEX-7 Trading Bot", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="APEX-7 Trading Bot", version="2.1.0", lifespan=lifespan)
 
 
 async def _ws_broadcaster():
@@ -97,6 +107,21 @@ async def _ws_broadcaster():
         except Exception as e:
             logger.debug(f"WS broadcast error: {e}")
         await asyncio.sleep(3)
+
+
+# ─────────────────────────────────────────
+#  Helpers
+# ─────────────────────────────────────────
+def _unrealized_pnl(trade: Trade, price: Optional[float]) -> tuple[Optional[float], Optional[float]]:
+    """Return (unrealized_pnl_usdt, unrealized_pnl_pct) for an OPEN trade
+    given a live price, or (None, None) if price isn't available."""
+    if not price or price <= 0 or not trade.entry_price:
+        return None, None
+    pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
+    if trade.side == "SELL":
+        pnl_pct = -pnl_pct
+    pnl_usdt = (trade.usdt_value or 0.0) * pnl_pct / 100
+    return pnl_usdt, pnl_pct
 
 
 # ─────────────────────────────────────────
@@ -135,8 +160,24 @@ async def api_trades(limit: int = 50, status: Optional[str] = None):
             q = q.where(Trade.status == status.upper())
         result = await session.execute(q)
         trades = result.scalars().all()
-    return [
-        {
+
+    # Live prices for any OPEN trades in this page, so we can show
+    # unrealized PnL per-row instead of leaving it blank until close.
+    open_symbols = list({t.symbol for t in trades if t.status == "OPEN"})
+    live_prices: dict[str, float] = {}
+    if open_symbols:
+        try:
+            live_prices = await fetch_all_prices(open_symbols)
+        except Exception:
+            live_prices = {}
+
+    out = []
+    for t in trades:
+        unrealized_usdt, unrealized_pct = (None, None)
+        if t.status == "OPEN":
+            unrealized_usdt, unrealized_pct = _unrealized_pnl(t, live_prices.get(t.symbol))
+
+        out.append({
             "id": t.id,
             "symbol": t.symbol,
             "side": t.side,
@@ -144,10 +185,13 @@ async def api_trades(limit: int = 50, status: Optional[str] = None):
             "exit_price": t.exit_price,
             "quantity": t.quantity,
             "usdt_value": t.usdt_value,
+            "risk_usdt": t.risk_usdt,
             "stop_loss": t.stop_loss,
             "take_profit": t.take_profit,
             "pnl_usdt": t.pnl_usdt,
             "pnl_pct": t.pnl_pct,
+            "unrealized_pnl_usdt": round(unrealized_usdt, 4) if unrealized_usdt is not None else None,
+            "unrealized_pnl_pct": round(unrealized_pct, 4) if unrealized_pct is not None else None,
             "status": t.status,
             "consensus_score": t.consensus_score,
             "agents_agree": t.agents_agree,
@@ -156,53 +200,74 @@ async def api_trades(limit: int = 50, status: Optional[str] = None):
             "notes": t.notes,
             "opened_at": t.opened_at.isoformat() if t.opened_at else None,
             "closed_at": t.closed_at.isoformat() if t.closed_at else None,
-        }
-        for t in trades
-    ]
+        })
+    return out
 
 
 @app.get("/api/performance")
 async def api_performance():
     async with AsyncSessionLocal() as session:
-        result = await session.execute(
+        closed_result = await session.execute(
             select(Trade).where(Trade.status == "CLOSED")
         )
-        trades = result.scalars().all()
+        closed = closed_result.scalars().all()
 
-    if not trades:
-        return {
+        open_result = await session.execute(
+            select(Trade).where(Trade.status == "OPEN")
+        )
+        open_trades = open_result.scalars().all()
+
+    # ── Unrealized PnL across all currently open positions ──
+    unrealized_pnl_usdt = 0.0
+    if open_trades:
+        try:
+            live_prices = await fetch_all_prices(list({t.symbol for t in open_trades}))
+        except Exception:
+            live_prices = {}
+        for t in open_trades:
+            pnl_usdt, _ = _unrealized_pnl(t, live_prices.get(t.symbol))
+            if pnl_usdt is not None:
+                unrealized_pnl_usdt += pnl_usdt
+
+    if not closed:
+        base = {
             "total_trades": 0, "winning_trades": 0, "losing_trades": 0,
             "win_rate_pct": 0, "total_pnl_usdt": 0,
             "avg_win_usdt": 0, "avg_loss_usdt": 0,
             "profit_factor": 0, "best_trade_pct": 0, "worst_trade_pct": 0,
             "avg_hold_minutes": 0,
         }
+    else:
+        wins = [t for t in closed if (t.pnl_usdt or 0) > 0]
+        losses = [t for t in closed if (t.pnl_usdt or 0) <= 0]
+        total_pnl = sum(t.pnl_usdt or 0 for t in closed)
+        gross_profit = sum(t.pnl_usdt for t in wins) if wins else 0
+        gross_loss = abs(sum(t.pnl_usdt for t in losses)) if losses else 1
 
-    wins = [t for t in trades if (t.pnl_usdt or 0) > 0]
-    losses = [t for t in trades if (t.pnl_usdt or 0) <= 0]
-    total_pnl = sum(t.pnl_usdt or 0 for t in trades)
-    gross_profit = sum(t.pnl_usdt for t in wins) if wins else 0
-    gross_loss = abs(sum(t.pnl_usdt for t in losses)) if losses else 1
+        hold_minutes = []
+        for t in closed:
+            if t.opened_at and t.closed_at:
+                diff = (t.closed_at - t.opened_at).total_seconds() / 60
+                hold_minutes.append(diff)
 
-    hold_minutes = []
-    for t in trades:
-        if t.opened_at and t.closed_at:
-            diff = (t.closed_at - t.opened_at).total_seconds() / 60
-            hold_minutes.append(diff)
+        base = {
+            "total_trades": len(closed),
+            "winning_trades": len(wins),
+            "losing_trades": len(losses),
+            "win_rate_pct": round(len(wins) / len(closed) * 100, 2),
+            "total_pnl_usdt": round(total_pnl, 4),
+            "avg_win_usdt": round(gross_profit / len(wins), 4) if wins else 0,
+            "avg_loss_usdt": round(-gross_loss / len(losses), 4) if losses else 0,
+            "profit_factor": round(gross_profit / gross_loss, 3),
+            "best_trade_pct": round(max((t.pnl_pct or 0) for t in closed), 3),
+            "worst_trade_pct": round(min((t.pnl_pct or 0) for t in closed), 3),
+            "avg_hold_minutes": round(sum(hold_minutes) / len(hold_minutes), 1) if hold_minutes else 0,
+        }
 
-    return {
-        "total_trades": len(trades),
-        "winning_trades": len(wins),
-        "losing_trades": len(losses),
-        "win_rate_pct": round(len(wins) / len(trades) * 100, 2),
-        "total_pnl_usdt": round(total_pnl, 4),
-        "avg_win_usdt": round(gross_profit / len(wins), 4) if wins else 0,
-        "avg_loss_usdt": round(-gross_loss / len(losses), 4) if losses else 0,
-        "profit_factor": round(gross_profit / gross_loss, 3),
-        "best_trade_pct": round(max((t.pnl_pct or 0) for t in trades), 3),
-        "worst_trade_pct": round(min((t.pnl_pct or 0) for t in trades), 3),
-        "avg_hold_minutes": round(sum(hold_minutes) / len(hold_minutes), 1) if hold_minutes else 0,
-    }
+    base["open_trades_count"] = len(open_trades)
+    base["unrealized_pnl_usdt"] = round(unrealized_pnl_usdt, 4)
+    base["combined_pnl_usdt"] = round(base["total_pnl_usdt"] + unrealized_pnl_usdt, 4)
+    return base
 
 
 @app.get("/api/signals")

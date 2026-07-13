@@ -5,6 +5,13 @@ SQLite via SQLAlchemy — stores trades, signals, and performance snapshots.
 Changes vs v1: added indices on the columns actually queried
 (status, symbol, created_at/opened_at) since the API filters/sorts on
 these constantly as trade history grows.
+
+Changes vs v2:
+  - Added `risk_usdt` to Trade. The Risk Manager already computed this
+    per-trade (PositionSize.risk_usdt) but it was never persisted, so
+    the dashboard/API had no way to show per-trade risk. Existing rows
+    will show NULL for this column (SQLite doesn't backfill history) —
+    only trades opened after this change populate it.
 """
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -32,6 +39,7 @@ class Trade(Base):
     exit_price: Mapped[float] = mapped_column(Float, nullable=True)
     quantity: Mapped[float] = mapped_column(Float)
     usdt_value: Mapped[float] = mapped_column(Float)
+    risk_usdt: Mapped[float] = mapped_column(Float, nullable=True)  # NEW — $ risked per trade
     stop_loss: Mapped[float] = mapped_column(Float, nullable=True)
     take_profit: Mapped[float] = mapped_column(Float, nullable=True)
     pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)

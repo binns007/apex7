@@ -14,6 +14,11 @@ Changes vs v1:
   - explicit handling when order placement succeeds but OCO exit fails
     (position is now flagged in the log/DB notes instead of silently
     left without protective exits)
+
+Changes vs v2:
+  - `pos.risk_usdt` (already computed by RiskManager.size_position) is
+    now actually persisted on the Trade row via _save_trade(), so the
+    dashboard can show $ at risk per trade instead of just usdt_value.
 """
 import asyncio
 import logging
@@ -187,6 +192,7 @@ class TradingEngine:
             entry_price=price,
             quantity=pos.quantity,
             usdt_value=pos.usdt_value,
+            risk_usdt=pos.risk_usdt,
             stop_loss=pos.stop_loss_price,
             take_profit=pos.take_profit_price,
             consensus_score=result.score,
