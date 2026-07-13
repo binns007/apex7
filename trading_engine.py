@@ -5,14 +5,19 @@ The central orchestrator. Every SCAN_INTERVAL_SECONDS it:
   1. Fetches portfolio value
   2. Checks existing positions for SL/TP hits
   3. Runs the Polyphonic Consensus Engine on each symbol
-  4. If consensus ≥ threshold → sizes position via Risk Manager
+  4. If consensus is reached → sizes position via Risk Manager
   5. Executes via Order Executor
   6. Persists everything to DB
 
-This is the "brain stem" connecting all modules.
+Changes vs v1:
+  - price NaN/None guard before it reaches risk sizing
+  - explicit handling when order placement succeeds but OCO exit fails
+    (position is now flagged in the log/DB notes instead of silently
+    left without protective exits)
 """
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -42,18 +47,22 @@ class TradingEngine:
             VolumeAgent(),
             SentimentAgent(),
             OrderBookAgent(),
-            ScalpingAgent(),
+            ScalpingAgent() if settings.SCALPING_ENABLED else None,
             RegimeAgent(),
         ]
-        self.consensus = PolyphonicConsensusEngine(agents)
-        self.risk      = RiskManager()
-        self.executor  = OrderExecutor()
+        agents = [a for a in agents if a is not None]
+        if not settings.SENTIMENT_ENABLED:
+            agents = [a for a in agents if a.name != "Sentiment"]
 
-        self._running  = False
+        self.consensus = PolyphonicConsensusEngine(agents)
+        self.risk = RiskManager()
+        self.executor = OrderExecutor()
+
+        self._running = False
         self._task: Optional[asyncio.Task] = None
         self._scan_count = 0
         self._last_scan: Optional[datetime] = None
-        self._status_log: list[str] = []    # ring buffer for UI
+        self._status_log: list[str] = []
 
     # ─────────────────────────────────────────
     #  Lifecycle
@@ -97,19 +106,15 @@ class TradingEngine:
         logger.info(f"── Scan #{self._scan_count} ──────────────────")
         self._log(f"Scan #{self._scan_count} started")
 
-        # 1. Portfolio value
         portfolio_usdt = await self.executor.get_usdt_balance()
         self.risk.update_portfolio_value(portfolio_usdt)
 
-        # 2. Check existing open positions
         await self._check_open_positions(portfolio_usdt)
 
-        # Halted? Skip new trades
         if self.risk.halted:
             self._log(f"🛑 Trading halted: {self.risk.halt_reason}")
             return
 
-        # 3. Evaluate each symbol
         for symbol in settings.TRADING_PAIRS:
             try:
                 await self._evaluate_symbol(symbol, portfolio_usdt)
@@ -117,31 +122,30 @@ class TradingEngine:
                 logger.error(f"Error evaluating {symbol}: {e}")
                 self._log(f"⚠ {symbol} eval error: {e}")
 
-        # 4. Save performance snapshot
         await self._save_snapshot(portfolio_usdt)
 
     async def _evaluate_symbol(self, symbol: str, portfolio_usdt: float):
-        # Skip if already in a position for this symbol
         if symbol in self.risk.open_positions:
             return
 
         result = await self.consensus.evaluate(symbol)
-
-        # Persist signals
         await self._save_signals(result.signals)
 
         if result.action == "HOLD":
             logger.debug(f"{symbol}: HOLD — {result.primary_reason}")
             return
 
-        # Get current price
         try:
             price = await fetch_price(symbol)
         except Exception as e:
             logger.error(f"Price fetch failed {symbol}: {e}")
             return
 
-        # Size position
+        if price is None or (isinstance(price, float) and math.isnan(price)) or price <= 0:
+            logger.error(f"Invalid price for {symbol}: {price}")
+            self._log(f"⚠ {symbol} invalid price, skipping")
+            return
+
         pos = self.risk.size_position(
             symbol=symbol,
             side=result.action,
@@ -156,16 +160,14 @@ class TradingEngine:
             self._log(f"⚠ {symbol} rejected: {pos.rejection_reason}")
             return
 
-        # Execute
         order = await self.executor.place_market_order(symbol, result.action, pos.quantity)
         if not order:
             self._log(f"❌ {symbol} order execution failed")
             return
 
-        # Place exit OCO
         exit_side = "SELL" if result.action == "BUY" else "BUY"
         sl_buffer = 0.998 if result.action == "BUY" else 1.002
-        await self.executor.place_oco_exit(
+        oco = await self.executor.place_oco_exit(
             symbol=symbol,
             side=exit_side,
             quantity=pos.quantity,
@@ -173,11 +175,12 @@ class TradingEngine:
             stop_price=pos.stop_loss_price,
             stop_limit_price=pos.stop_loss_price * sl_buffer,
         )
+        exit_note = "" if oco else " (⚠ OCO exit failed — position has NO automatic TP/SL, monitor manually)"
+        if not oco:
+            self._log(f"⚠ {symbol} entered but OCO exit failed — manual monitoring required")
 
-        # Track in risk manager
         self.risk.on_trade_open(symbol, pos.risk_usdt)
 
-        # Persist to DB
         await self._save_trade(
             symbol=symbol,
             side=result.action,
@@ -189,12 +192,13 @@ class TradingEngine:
             consensus_score=result.score,
             agents_agree=result.agents_agree,
             regime=result.regime,
-            binance_order_id=str(order.get("orderId", "")),  # ← FIXED
+            binance_order_id=str(order.get("orderId", "")),
+            notes=(result.primary_reason + exit_note) if exit_note else result.primary_reason,
         )
 
         msg = (f"✅ {result.action} {symbol} @ {price:.4f} "
                f"qty={pos.quantity:.6f} TP={pos.take_profit_price:.4f} "
-               f"SL={pos.stop_loss_price:.4f} score={result.score:.3f}")
+               f"SL={pos.stop_loss_price:.4f} score={result.score:.3f}{exit_note}")
         logger.info(msg)
         self._log(msg)
 
@@ -202,7 +206,6 @@ class TradingEngine:
     #  Position monitoring (basic SL/TP poll)
     # ─────────────────────────────────────────
     async def _check_open_positions(self, portfolio_usdt: float):
-        """Poll open DB trades and check if SL/TP has been hit."""
         async with AsyncSessionLocal() as session:
             result = await session.execute(
                 select(Trade).where(Trade.status == "OPEN")
@@ -228,11 +231,11 @@ class TradingEngine:
                 hit_sl = price >= trade.stop_loss
 
             if hit_tp or hit_sl:
-                pnl_pct  = (price - trade.entry_price) / trade.entry_price * 100
+                pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
                 if trade.side == "SELL":
                     pnl_pct = -pnl_pct
                 pnl_usdt = trade.usdt_value * pnl_pct / 100
-                label    = "TP" if hit_tp else "SL"
+                label = "TP" if hit_tp else "SL"
 
                 await self._close_trade(trade, price, pnl_usdt, pnl_pct)
                 self.risk.on_trade_close(trade.symbol, pnl_usdt, hit_tp)

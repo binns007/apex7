@@ -3,35 +3,28 @@ APEX-7 FastAPI Application
 ══════════════════════════
 REST + WebSocket API powering the dashboard UI.
 
-Routes:
-  GET  /                          → Dashboard HTML
-  GET  /api/status                → Engine status + risk summary
-  POST /api/engine/start          → Start engine
-  POST /api/engine/stop           → Stop engine
-  POST /api/engine/resume         → Resume after halt
-  GET  /api/trades                → Trade history
-  GET  /api/performance           → Performance metrics
-  GET  /api/signals               → Recent agent signals
-  GET  /api/market/{symbol}       → Live price + indicators
-  POST /api/settings              → Update runtime settings
-  WS   /ws                        → Live event stream for UI
+Changes vs v1:
+  - /api/status now includes config validation warnings so problems
+    (e.g. live mode with no API key) surface in the dashboard, not
+    just server logs.
+  - /api/trades exposes `notes` (used to flag a failed OCO exit — a
+    position with no automatic TP/SL needs a human's attention).
+  - clean shutdown of the shared aiohttp session in market_data.
 """
 import asyncio
-import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy import select, desc
 
 from config import settings
 from database import init_db, AsyncSessionLocal, Trade, AgentSignal, PerformanceSnapshot
-from market_data import fetch_price, fetch_all_prices, fetch_candles
+from market_data import fetch_price, fetch_all_prices, fetch_candles, shutdown as market_data_shutdown
 from trading_engine import engine
 
 logging.basicConfig(
@@ -42,9 +35,6 @@ logging.basicConfig(
 logger = logging.getLogger("apex7.api")
 
 
-# ─────────────────────────────────────────
-#  WebSocket connection manager
-# ─────────────────────────────────────────
 class ConnectionManager:
     def __init__(self):
         self.active: list[WebSocket] = []
@@ -54,7 +44,8 @@ class ConnectionManager:
         self.active.append(ws)
 
     def disconnect(self, ws: WebSocket):
-        self.active.remove(ws)
+        if ws in self.active:
+            self.active.remove(ws)
 
     async def broadcast(self, data: dict):
         dead = []
@@ -64,31 +55,30 @@ class ConnectionManager:
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            self.active.remove(ws)
+            self.disconnect(ws)
 
 
 ws_manager = ConnectionManager()
 
 
-# ─────────────────────────────────────────
-#  App startup / shutdown
-# ─────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     logger.info("✅ Database initialized")
-    # Start WS broadcaster
-    asyncio.create_task(_ws_broadcaster())
+    problems = settings.validate()
+    if problems:
+        for p in problems:
+            logger.warning("⚠ Config issue: %s", p)
+    broadcaster_task = asyncio.create_task(_ws_broadcaster())
     yield
     engine.stop()
+    broadcaster_task.cancel()
+    await market_data_shutdown()
 
 
-app = FastAPI(title="APEX-7 Trading Bot", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="APEX-7 Trading Bot", version="2.0.0", lifespan=lifespan)
 
 
-# ─────────────────────────────────────────
-#  WS broadcaster task (pushes updates every 3s)
-# ─────────────────────────────────────────
 async def _ws_broadcaster():
     while True:
         try:
@@ -114,7 +104,9 @@ async def _ws_broadcaster():
 # ─────────────────────────────────────────
 @app.get("/api/status")
 async def api_status():
-    return engine.get_status()
+    status = engine.get_status()
+    status["config_warnings"] = settings.validate()
+    return status
 
 
 @app.post("/api/engine/start")
@@ -161,6 +153,7 @@ async def api_trades(limit: int = 50, status: Optional[str] = None):
             "agents_agree": t.agents_agree,
             "regime": t.regime,
             "is_testnet": t.is_testnet,
+            "notes": t.notes,
             "opened_at": t.opened_at.isoformat() if t.opened_at else None,
             "closed_at": t.closed_at.isoformat() if t.closed_at else None,
         }
@@ -185,11 +178,11 @@ async def api_performance():
             "avg_hold_minutes": 0,
         }
 
-    wins  = [t for t in trades if (t.pnl_usdt or 0) > 0]
-    losses= [t for t in trades if (t.pnl_usdt or 0) <= 0]
-    total_pnl   = sum(t.pnl_usdt or 0 for t in trades)
-    gross_profit= sum(t.pnl_usdt for t in wins) if wins else 0
-    gross_loss  = abs(sum(t.pnl_usdt for t in losses)) if losses else 1
+    wins = [t for t in trades if (t.pnl_usdt or 0) > 0]
+    losses = [t for t in trades if (t.pnl_usdt or 0) <= 0]
+    total_pnl = sum(t.pnl_usdt or 0 for t in trades)
+    gross_profit = sum(t.pnl_usdt for t in wins) if wins else 0
+    gross_loss = abs(sum(t.pnl_usdt for t in losses)) if losses else 1
 
     hold_minutes = []
     for t in trades:
@@ -242,15 +235,19 @@ async def api_market(symbol: str, interval: str = "5m"):
         df = await fetch_candles(symbol, interval, 60)
         price = float(df["close"].iloc[-1])
         last = df.iloc[-1]
+
+        def safe(val):
+            return None if val != val else round(float(val), 6)  # NaN != NaN
+
         return {
             "symbol": symbol,
             "price": price,
-            "rsi": round(float(last["rsi"]), 2) if not __import__("math").isnan(last["rsi"]) else None,
-            "macd_hist": round(float(last["macd_hist"]), 6) if not __import__("math").isnan(last["macd_hist"]) else None,
-            "bb_pct": round(float(last["bb_pct"]), 4) if not __import__("math").isnan(last["bb_pct"]) else None,
-            "vol_zscore": round(float(last["vol_zscore"]), 3) if not __import__("math").isnan(last["vol_zscore"]) else None,
-            "adx": round(float(last["adx"]), 2) if not __import__("math").isnan(last["adx"]) else None,
-            "atr": round(float(last["atr"]), 6) if not __import__("math").isnan(last["atr"]) else None,
+            "rsi": safe(last["rsi"]),
+            "macd_hist": safe(last["macd_hist"]),
+            "bb_pct": safe(last["bb_pct"]),
+            "vol_zscore": safe(last["vol_zscore"]),
+            "adx": safe(last["adx"]),
+            "atr": safe(last["atr"]),
             "candles": [
                 {
                     "t": int(row["open_time"].timestamp() * 1000),
@@ -274,6 +271,8 @@ class SettingsUpdate(BaseModel):
     min_agents_agree: Optional[int] = None
     max_portfolio_risk_pct: Optional[float] = None
     trade_usdt_cap: Optional[float] = None
+    require_temporal_confluence: Optional[bool] = None
+    regime_hard_block_volatile: Optional[bool] = None
 
 
 @app.post("/api/settings")
@@ -282,7 +281,7 @@ async def api_update_settings(body: SettingsUpdate):
         settings.TRADING_MODE = body.trading_mode
         engine.executor.reconnect()
     if body.trading_pairs:
-        settings.TRADING_PAIRS = [p.strip().upper() for p in body.trading_pairs]
+        settings.TRADING_PAIRS = [p.strip().upper() for p in body.trading_pairs if p.strip()]
     if body.min_consensus_score is not None:
         settings.MIN_CONSENSUS_SCORE = body.min_consensus_score
     if body.min_agents_agree is not None:
@@ -291,25 +290,25 @@ async def api_update_settings(body: SettingsUpdate):
         settings.MAX_PORTFOLIO_RISK_PCT = body.max_portfolio_risk_pct
     if body.trade_usdt_cap is not None:
         settings.TRADE_USDT_CAP = body.trade_usdt_cap
-    return {"ok": True, "mode": settings.TRADING_MODE}
+    if body.require_temporal_confluence is not None:
+        settings.REQUIRE_TEMPORAL_CONFLUENCE = body.require_temporal_confluence
+    if body.regime_hard_block_volatile is not None:
+        settings.REGIME_HARD_BLOCK_VOLATILE = body.regime_hard_block_volatile
+
+    warnings = settings.validate()
+    return {"ok": True, "mode": settings.TRADING_MODE, "config_warnings": warnings}
 
 
-# ─────────────────────────────────────────
-#  WebSocket endpoint
-# ─────────────────────────────────────────
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
         while True:
-            await websocket.receive_text()  # keep alive
+            await websocket.receive_text()
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
 
 
-# ─────────────────────────────────────────
-#  Dashboard HTML (served inline)
-# ─────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
     with open("static/index.html", "r") as f:

@@ -3,6 +3,7 @@ Agent 3 — Breakout Agent
 Detects consolidation followed by expansion. Identifies key S/R levels
 from pivot highs/lows and fires on confirmed breakouts with volume.
 """
+import math
 import numpy as np
 import pandas as pd
 from agents.base_agent import BaseAgent, AgentSignal
@@ -16,33 +17,29 @@ class BreakoutAgent(BaseAgent):
         if len(df) < 50:
             return self.hold(symbol, timeframe, "Insufficient candles")
 
-        last    = df.iloc[-1]
-        close   = last["close"]
-        high    = last["high"]
-        low     = last["low"]
-        vol_z   = last["vol_zscore"]
-        bb_w    = last["bb_width"]
-        atr     = last["atr"]
-        adx     = last["adx"]
+        last = df.iloc[-1]
+        fields = [last["vol_zscore"], last["bb_width"], last["atr"], last["adx"]]
+        if any(math.isnan(v) for v in fields):
+            return self.hold(symbol, timeframe, "Indicators still warming up")
 
-        # ── Find recent S/R via pivot points ───────
+        close = last["close"]
+        vol_z = last["vol_zscore"]
+        bb_w = last["bb_width"]
+        atr = last["atr"]
+        adx = last["adx"]
+
         pivot_window = 20
         recent = df.tail(pivot_window + 1).iloc[:-1]
         resistance = recent["high"].max()
-        support    = recent["low"].min()
+        support = recent["low"].min()
 
-        # ── Breakout detection ─────────────────────
-        broke_up   = close > resistance * 1.002  # price above resistance
-        broke_down = close < support * 0.998     # price below support
+        broke_up = close > resistance * 1.002
+        broke_down = close < support * 0.998
 
-        # BB expansion (volatility breakout)
         prev_bb_w = df["bb_width"].iloc[-5:-1].mean()
-        bb_expanding = bb_w > prev_bb_w * 1.1
+        bb_expanding = not math.isnan(prev_bb_w) and bb_w > prev_bb_w * 1.1
 
-        # Volume confirmation
-        vol_confirmed = vol_z > 0.8              # above-average volume
-
-        # Trend strength confirmation
+        vol_confirmed = vol_z > 0.8
         trending = adx > 25
 
         buy_score = sell_score = 0.0
@@ -55,7 +52,6 @@ class BreakoutAgent(BaseAgent):
                 buy_score += 0.15
             if trending:
                 buy_score += 0.15
-            # Candle body quality (strong green candle)
             body = close - last["open"]
             if body > 0 and body > atr * 0.4:
                 buy_score += 0.10

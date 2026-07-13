@@ -1,24 +1,27 @@
 """
 APEX-7 — Polyphonic Consensus Engine (PCE)
 ══════════════════════════════════════════
-The PCE is the defining innovation of APEX-7.
+Eight specialized agents each independently analyse the market from a
+different perspective. Each vote is WEIGHTED by the agent's recent
+accuracy and by the signal's confidence.
 
-Instead of one strategy, eight specialized agents each independently
-analyse the market from a different perspective. Each vote is WEIGHTED
-by the agent's recent accuracy and by the signal's confidence.
-
-A trade only fires when:
-  1. Weighted consensus score ≥ MIN_CONSENSUS_SCORE
-  2. At least MIN_AGENTS_AGREE agents point in the same direction
-  3. Temporal confluence: the primary signal aligns on 2+ timeframes
-  4. The regime agent confirms (or is neutral) — never fight the regime
-
-This means APEX-7 only enters trades where multiple independent
-evidence streams converge at the same moment — massively reducing
-false positives while catching high-quality setups.
+Changes vs v1 (see inline comments for each):
+  1. FIXED BUG: exact BUY/SELL ties on the primary timeframe used to
+     silently resolve to SELL (`"BUY" if buy>sell else "SELL"` had no
+     equality branch). Now explicit and configurable (default HOLD).
+  2. The VOLATILE regime used to HARD BLOCK all trading before the
+     score was even computed. It's now a configurable soft multiplier
+     applied to the score (matches how a human desk would actually
+     reduce, not zero out, conviction in choppy conditions).
+  3. Temporal confluence used to be an unconditional hard gate. It's
+     now a soft score bonus/penalty by default, with a config flag to
+     restore the hard-gate behavior.
+  4. NaN-safe: ATR-based R/R sizing no longer silently propagates NaN
+     into stop-loss/take-profit percentages.
 """
 import asyncio
 import logging
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
@@ -27,7 +30,7 @@ import pandas as pd
 
 from config import settings
 from agents.base_agent import BaseAgent, AgentSignal
-from agents.regime_agent import RegimeAgent, REGIME_VOLATILE
+from agents.regime_agent import RegimeAgent, REGIME_VOLATILE, REGIME_UNKNOWN
 from market_data import fetch_candles, fetch_orderbook, fetch_fear_greed, fetch_funding_rate
 
 logger = logging.getLogger("apex7.consensus")
@@ -43,14 +46,13 @@ class ConsensusResult:
     regime: str
     signals: list[AgentSignal] = field(default_factory=list)
     primary_reason: str = ""
-    stop_loss_pct: float = 0.012   # default 1.2%
-    take_profit_pct: float = 0.024  # default 2.4% (2:1 R/R)
+    stop_loss_pct: float = 0.012
+    take_profit_pct: float = 0.024
 
 
 class PolyphonicConsensusEngine:
     def __init__(self, agents: list[BaseAgent]):
         self.agents = agents
-        # Dynamic weights: adjusted based on agent rolling accuracy
         self._accuracy: dict[str, list[bool]] = defaultdict(list)
 
     # ─────────────────────────────────────────
@@ -59,7 +61,6 @@ class PolyphonicConsensusEngine:
     async def evaluate(self, symbol: str) -> ConsensusResult:
         """Run all agents across all timeframes and return consensus."""
 
-        # ── 1. Fetch data for all timeframes ──
         candles: dict[str, pd.DataFrame] = {}
         for tf in settings.TIMEFRAMES:
             try:
@@ -69,71 +70,81 @@ class PolyphonicConsensusEngine:
 
         if not candles:
             return ConsensusResult(symbol=symbol, action="HOLD", score=0.0,
-                                   agents_agree=0, total_agents=0, regime="UNKNOWN")
+                                    agents_agree=0, total_agents=0, regime=REGIME_UNKNOWN)
 
-        # ── 2. Fetch extras ───────────────────
         extras = await self._fetch_extras(symbol)
 
-        # ── 3. Collect signals from all agents ─
         all_signals: list[AgentSignal] = []
-        tasks = []
-        for agent in self.agents:
-            for tf, df in candles.items():
-                tasks.append(self._safe_analyze(agent, symbol, tf, df, extras))
-
+        tasks = [
+            self._safe_analyze(agent, symbol, tf, df, extras)
+            for agent in self.agents
+            for tf, df in candles.items()
+        ]
         results = await asyncio.gather(*tasks)
         all_signals = [r for r in results if r is not None]
 
-        # ── 4. Regime check ───────────────────
+        # ── Regime: soft by default, hard-block only if explicitly enabled ──
         regime = RegimeAgent.get_regime(symbol)
+        regime_multiplier = 1.0
         if regime == REGIME_VOLATILE:
-            logger.info(f"{symbol}: Regime=VOLATILE — skipping consensus")
-            return ConsensusResult(symbol=symbol, action="HOLD", score=0.0,
-                                   agents_agree=0, total_agents=len(all_signals),
-                                   regime=regime, signals=all_signals,
-                                   primary_reason="Regime: VOLATILE — trading paused")
+            if settings.REGIME_HARD_BLOCK_VOLATILE:
+                logger.info(f"{symbol}: Regime=VOLATILE — hard block enabled, skipping")
+                return ConsensusResult(symbol=symbol, action="HOLD", score=0.0,
+                                        agents_agree=0, total_agents=len(all_signals),
+                                        regime=regime, signals=all_signals,
+                                        primary_reason="Regime: VOLATILE — trading paused (hard block)")
+            regime_multiplier = settings.REGIME_VOLATILE_SCORE_MULTIPLIER
+            logger.info(f"{symbol}: Regime=VOLATILE — applying {regime_multiplier}x score penalty")
 
-        # ── 5. Temporal confluence filter ──────
-        # Primary timeframe = 5m. Signal must also appear on 1m OR 15m
-        primary_tf = "5m"
+        primary_tf = settings.PRIMARY_TIMEFRAME
         primary_signals = [s for s in all_signals if s.timeframe == primary_tf and s.signal != "HOLD"]
         if not primary_signals:
             return ConsensusResult(symbol=symbol, action="HOLD", score=0.0,
-                                   agents_agree=0, total_agents=len(all_signals),
-                                   regime=regime, signals=all_signals,
-                                   primary_reason="No primary (5m) signal found")
+                                    agents_agree=0, total_agents=len(all_signals),
+                                    regime=regime, signals=all_signals,
+                                    primary_reason=f"No primary ({primary_tf}) signal found")
 
-        # Determine primary direction
-        buy_count  = sum(1 for s in primary_signals if s.signal == "BUY")
+        # ── Determine primary direction — FIXED: exact ties no longer
+        #    silently resolve to SELL. ──
+        buy_count = sum(1 for s in primary_signals if s.signal == "BUY")
         sell_count = sum(1 for s in primary_signals if s.signal == "SELL")
-        direction  = "BUY" if buy_count > sell_count else "SELL"
+        if buy_count == sell_count:
+            direction = settings.TIE_BREAK_ACTION
+            if direction == "HOLD":
+                return ConsensusResult(symbol=symbol, action="HOLD", score=0.0,
+                                        agents_agree=0, total_agents=len(all_signals),
+                                        regime=regime, signals=all_signals,
+                                        primary_reason=f"Primary timeframe tied {buy_count}-{sell_count} → HOLD")
+        else:
+            direction = "BUY" if buy_count > sell_count else "SELL"
 
-        # Confirm on at least one other timeframe
+        # ── Temporal confluence: soft bonus/penalty by default ──
         other_tfs = [tf for tf in settings.TIMEFRAMES if tf != primary_tf]
         confirmed = any(
             any(s.signal == direction and s.timeframe == tf for s in all_signals)
             for tf in other_tfs
         )
-        if not confirmed:
+        if not confirmed and settings.REQUIRE_TEMPORAL_CONFLUENCE:
             return ConsensusResult(symbol=symbol, action="HOLD", score=0.0,
-                                   agents_agree=0, total_agents=len(all_signals),
-                                   regime=regime, signals=all_signals,
-                                   primary_reason=f"No temporal confluence for {direction}")
+                                    agents_agree=0, total_agents=len(all_signals),
+                                    regime=regime, signals=all_signals,
+                                    primary_reason=f"No temporal confluence for {direction}")
 
-        # ── 6. Weighted consensus score ────────
+        # ── Weighted consensus score ────────
         score, agree_count = self._compute_weighted_score(all_signals, direction)
+        score *= regime_multiplier
+        if confirmed:
+            score = min(score + settings.CONFLUENCE_SCORE_BONUS, 1.0)
+        else:
+            score = max(score - settings.NO_CONFLUENCE_SCORE_PENALTY, 0.0)
 
-        # ── 7. Threshold check ────────────────
         if (score >= settings.MIN_CONSENSUS_SCORE and
                 agree_count >= settings.MIN_AGENTS_AGREE):
 
-            # Compute dynamic R/R from ATR
-            sl_pct, tp_pct = self._dynamic_rr(candles.get("5m"), regime)
+            sl_pct, tp_pct = self._dynamic_rr(candles.get(primary_tf), regime)
 
-            top_reason = sorted(
-                [s for s in all_signals if s.signal == direction],
-                key=lambda s: s.confidence, reverse=True
-            )[0].reason if all_signals else ""
+            directional = [s for s in all_signals if s.signal == direction]
+            top_reason = max(directional, key=lambda s: s.confidence).reason if directional else ""
 
             logger.info(f"✅ {symbol} CONSENSUS {direction} score={score:.3f} agents={agree_count}")
             return ConsensusResult(
@@ -154,7 +165,8 @@ class PolyphonicConsensusEngine:
             agents_agree=agree_count,
             total_agents=len(set(s.agent_name for s in all_signals)),
             regime=regime, signals=all_signals,
-            primary_reason=f"Threshold not met: score={score:.3f} agree={agree_count}"
+            primary_reason=f"Threshold not met: score={score:.3f} agree={agree_count} "
+                            f"(need score>={settings.MIN_CONSENSUS_SCORE}, agree>={settings.MIN_AGENTS_AGREE})"
         )
 
     # ─────────────────────────────────────────
@@ -186,10 +198,7 @@ class PolyphonicConsensusEngine:
     def _compute_weighted_score(
         self, signals: list[AgentSignal], direction: str
     ) -> tuple[float, int]:
-        """
-        Weight each agent's signal by:
-          agent.weight × signal.confidence × accuracy_multiplier
-        """
+        """Weight each agent's signal by agent.weight × confidence × accuracy."""
         agent_map: dict[str, list[AgentSignal]] = defaultdict(list)
         for s in signals:
             agent_map[s.agent_name].append(s)
@@ -205,28 +214,26 @@ class PolyphonicConsensusEngine:
             base_weight = agent.weight if agent else 1.0
             acc_mult = self._accuracy_multiplier(agent_name)
 
-            # Use the highest confidence signal from this agent (any TF)
             best = max(sigs, key=lambda s: s.confidence if s.signal == direction else -1)
 
             if best.signal == direction and best.confidence > 0:
                 weighted_agree += base_weight * best.confidence * acc_mult
                 agree_count += 1
 
-            # Count all signals (including HOLD) as total weight
             max_conf = max(s.confidence for s in sigs)
             weighted_total += base_weight * max(max_conf, 0.3) * acc_mult
 
-        score = weighted_agree / (weighted_total + 1e-9)
+        if weighted_total <= 0:
+            return 0.0, agree_count
+        score = weighted_agree / weighted_total
         return min(score, 1.0), agree_count
 
     def _accuracy_multiplier(self, agent_name: str) -> float:
-        """Agents with better recent accuracy get higher weights."""
         history = self._accuracy.get(agent_name, [])
         if len(history) < 5:
             return 1.0
         recent = history[-20:]
         win_rate = sum(recent) / len(recent)
-        # Scale: 0.7× for bad agents, 1.3× for great agents
         return 0.7 + win_rate * 0.6
 
     def update_agent_accuracy(self, agent_name: str, was_correct: bool):
@@ -235,18 +242,24 @@ class PolyphonicConsensusEngine:
     def _dynamic_rr(
         self, df: Optional[pd.DataFrame], regime: str
     ) -> tuple[float, float]:
-        """Calculate ATR-based stop loss and take profit %."""
+        """Calculate ATR-based stop loss and take profit %.
+        FIXED: v1 didn't guard against NaN ATR (possible before the ATR
+        warmup period completes), which could silently propagate NaN
+        into position sizing downstream."""
         if df is None or df.empty:
             return 0.012, 0.024
 
-        atr     = df["atr"].iloc[-1]
-        close   = df["close"].iloc[-1]
+        atr = df["atr"].iloc[-1]
+        close = df["close"].iloc[-1]
+
+        if math.isnan(atr) or math.isnan(close) or close <= 0:
+            return 0.012, 0.024
+
         atr_pct = atr / close
+        if math.isnan(atr_pct):
+            return 0.012, 0.024
 
-        # Stop: 1.5× ATR below entry
         sl = min(max(atr_pct * 1.5, 0.008), 0.025)
-
-        # TP: 2:1 risk/reward in ranging, 3:1 in trending
         rr = 3.0 if "TREND" in regime else 2.0
         tp = sl * rr
 

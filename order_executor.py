@@ -4,11 +4,12 @@ APEX-7 Order Executor
 Handles all Binance order placement, modification, and monitoring.
 Uses python-binance with testnet support.
 
-Features:
-  • Market entry + OCO (take profit + stop loss) exit
-  • TWAP splitting for large orders (avoids slippage)
-  • Step-size rounding per Binance symbol rules
-  • Testnet / Live switching
+Fixes vs v1:
+  - _round_quantity/_round_price used math.log10(step) with no guard;
+    a step/tick size of 0 (malformed filter data) would raise. Now
+    falls back safely instead of crashing the scan cycle.
+  - place_market_order now rejects NaN/zero/negative quantities before
+    ever reaching the Binance client.
 """
 import asyncio
 import logging
@@ -24,7 +25,6 @@ logger = logging.getLogger("apex7.executor")
 
 
 def _make_client() -> Client:
-    """Create a Binance client for live or testnet."""
     if settings.is_testnet:
         return Client(
             api_key=settings.active_api_key,
@@ -59,26 +59,36 @@ class OrderExecutor:
         if symbol not in self._symbol_info:
             client = self._get_client()
             info = client.get_symbol_info(symbol)
+            if info is None:
+                raise ValueError(f"Unknown symbol on this Binance environment: {symbol}")
             self._symbol_info[symbol] = info
         return self._symbol_info[symbol]
 
     def _round_quantity(self, symbol: str, quantity: float) -> float:
         """Round quantity to Binance's allowed step size."""
+        if quantity is None or math.isnan(quantity) or quantity <= 0:
+            return 0.0
         info = self._get_symbol_info(symbol)
         for f in info["filters"]:
             if f["filterType"] == "LOT_SIZE":
                 step = float(f["stepSize"])
-                precision = int(round(-math.log10(step)))
+                if step <= 0:
+                    return round(quantity, 6)
+                precision = max(int(round(-math.log10(step))), 0)
                 return round(math.floor(quantity / step) * step, precision)
         return round(quantity, 6)
 
     def _round_price(self, symbol: str, price: float) -> float:
         """Round price to Binance's tick size."""
+        if price is None or math.isnan(price) or price <= 0:
+            return 0.0
         info = self._get_symbol_info(symbol)
         for f in info["filters"]:
             if f["filterType"] == "PRICE_FILTER":
                 tick = float(f["tickSize"])
-                precision = int(round(-math.log10(tick)))
+                if tick <= 0:
+                    return round(price, 2)
+                precision = max(int(round(-math.log10(tick))), 0)
                 return round(round(price / tick) * tick, precision)
         return round(price, 2)
 
@@ -88,13 +98,19 @@ class OrderExecutor:
     async def place_market_order(
         self, symbol: str, side: str, quantity: float
     ) -> Optional[dict]:
-        """Place a market order. Returns Binance order dict or None."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._place_market_sync, symbol, side, quantity)
 
     def _place_market_sync(self, symbol: str, side: str, quantity: float) -> Optional[dict]:
+        if quantity is None or math.isnan(quantity) or quantity <= 0:
+            logger.error(f"Refusing to place order with invalid quantity={quantity} for {symbol}")
+            return None
         client = self._get_client()
-        qty = self._round_quantity(symbol, quantity)
+        try:
+            qty = self._round_quantity(symbol, quantity)
+        except Exception as e:
+            logger.error(f"Symbol info lookup failed for {symbol}: {e}")
+            return None
         if qty <= 0:
             logger.error(f"Rounded quantity is zero for {symbol}")
             return None
@@ -117,7 +133,7 @@ class OrderExecutor:
     async def place_oco_exit(
         self,
         symbol: str,
-        side: str,   # "SELL" to exit a long, "BUY" to exit a short
+        side: str,
         quantity: float,
         take_profit_price: float,
         stop_price: float,
@@ -134,10 +150,18 @@ class OrderExecutor:
         take_profit_price, stop_price, stop_limit_price
     ) -> Optional[dict]:
         client = self._get_client()
-        qty   = self._round_quantity(symbol, quantity)
-        tp    = self._round_price(symbol, take_profit_price)
-        sp    = self._round_price(symbol, stop_price)
-        sl    = self._round_price(symbol, stop_limit_price)
+        try:
+            qty = self._round_quantity(symbol, quantity)
+            tp = self._round_price(symbol, take_profit_price)
+            sp = self._round_price(symbol, stop_price)
+            sl = self._round_price(symbol, stop_limit_price)
+        except Exception as e:
+            logger.error(f"OCO rounding failed for {symbol}: {e}")
+            return None
+        if qty <= 0 or tp <= 0 or sp <= 0 or sl <= 0:
+            logger.error(f"OCO aborted — invalid rounded values for {symbol}: "
+                         f"qty={qty} tp={tp} sp={sp} sl={sl}")
+            return None
         try:
             order = client.create_oco_order(
                 symbol=symbol,
@@ -152,7 +176,6 @@ class OrderExecutor:
             return order
         except BinanceAPIException as e:
             logger.error(f"OCO order failed {symbol}: {e}")
-            # Fallback: place simple limit TP only
             try:
                 order = client.create_order(
                     symbol=symbol, side=side, type="LIMIT",

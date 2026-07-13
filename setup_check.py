@@ -33,21 +33,32 @@ except ImportError as e:
 os.makedirs("data", exist_ok=True)
 print("✅ Data directory ready")
 
-# 4. Load config
+# 4. Load + validate config
 from config import settings
+problems = settings.validate()
 print(f"✅ Config loaded — Mode: {settings.TRADING_MODE.upper()}")
 print(f"   Pairs: {', '.join(settings.TRADING_PAIRS)}")
-print(f"   Consensus threshold: {settings.MIN_CONSENSUS_SCORE}")
+print(f"   Consensus threshold: {settings.MIN_CONSENSUS_SCORE}  |  Min agents agree: {settings.MIN_AGENTS_AGREE}")
+print(f"   Temporal confluence hard-gate: {settings.REQUIRE_TEMPORAL_CONFLUENCE}")
+print(f"   Volatile regime hard block: {settings.REGIME_HARD_BLOCK_VOLATILE}")
+if problems:
+    print("⚠  Config warnings:")
+    for p in problems:
+        print(f"   - {p}")
+else:
+    print("✅ Config validation passed")
 
 # 5. Test Binance connection
 async def test_binance():
-    from market_data import fetch_price
+    from market_data import fetch_price, shutdown
     try:
         price = await fetch_price("BTCUSDT")
         print(f"✅ Binance API reachable — BTC price: ${price:,.2f}")
     except Exception as e:
         print(f"⚠  Binance API error: {e}")
         print("   Check your internet connection. API keys are only needed for live trading.")
+    finally:
+        await shutdown()
 
 asyncio.run(test_binance())
 

@@ -1,3 +1,6 @@
 .env
 venv
 __pycache__
+.Ds_Store
+apex7.db
+data

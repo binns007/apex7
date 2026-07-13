@@ -16,6 +16,11 @@ class AgentSignal:
     confidence: float    # 0.0 – 1.0
     reason: str
 
+    def __post_init__(self):
+        if self.signal not in ("BUY", "SELL", "HOLD"):
+            raise ValueError(f"Invalid signal '{self.signal}' from {self.agent_name}")
+        self.confidence = min(max(float(self.confidence), 0.0), 1.0)
+
 
 class BaseAgent(ABC):
     name: str = "BaseAgent"
@@ -47,3 +52,6 @@ class BaseAgent(ABC):
 
     def hold(self, symbol, tf, reason="No clear edge") -> AgentSignal:
         return self._signal(symbol, tf, "HOLD", 0.0, reason)
+
+    def __repr__(self) -> str:
+        return f"<{self.name} weight={self.weight}>"

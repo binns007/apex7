@@ -3,6 +3,7 @@ Agent 2 — Mean Reversion Agent
 Identifies over-extended moves using Bollinger Bands, RSI extremes,
 and Z-score to fade the move back to the mean.
 """
+import math
 import numpy as np
 import pandas as pd
 from agents.base_agent import BaseAgent, AgentSignal
@@ -16,27 +17,28 @@ class MeanReversionAgent(BaseAgent):
         if len(df) < 30:
             return self.hold(symbol, timeframe, "Insufficient candles")
 
-        last   = df.iloc[-1]
-        close  = last["close"]
-        rsi    = last["rsi"]
-        bb_pct = last["bb_pct"]    # 0 = at lower band, 1 = at upper band
-        bb_w   = last["bb_width"]  # band width relative to midline
-        vwap   = last["vwap"]
-        atr    = last["atr"]
+        last = df.iloc[-1]
+        fields = [last["rsi"], last["bb_pct"], last["bb_width"], last["vwap"]]
+        if any(math.isnan(v) for v in fields):
+            return self.hold(symbol, timeframe, "Indicators still warming up")
 
-        # Z-score of close vs 20-period mean
+        close = last["close"]
+        rsi = last["rsi"]
+        bb_pct = last["bb_pct"]    # 0 = at lower band, 1 = at upper band
+        bb_w = last["bb_width"]    # band width relative to midline
+        vwap = last["vwap"]
+
         window = df["close"].tail(20)
         z_score = (close - window.mean()) / (window.std() + 1e-9)
 
         buy_score = sell_score = 0.0
 
-        # ── Oversold conditions ─────────────────────
         if rsi < 30:
             buy_score += 0.30
         elif rsi < 40:
             buy_score += 0.15
 
-        if bb_pct < 0.05:                    # price touching/below lower BB
+        if bb_pct < 0.05:
             buy_score += 0.30
         elif bb_pct < 0.15:
             buy_score += 0.15
@@ -46,10 +48,9 @@ class MeanReversionAgent(BaseAgent):
         elif z_score < -1.5:
             buy_score += 0.15
 
-        if close < vwap * 0.995:             # price below VWAP
+        if close < vwap * 0.995:
             buy_score += 0.10
 
-        # ── Overbought conditions ───────────────────
         if rsi > 70:
             sell_score += 0.30
         elif rsi > 60:
@@ -69,8 +70,7 @@ class MeanReversionAgent(BaseAgent):
             sell_score += 0.10
 
         # Only trade mean reversion in low-trend environments (tight BB)
-        bb_filter = bb_w < 0.06  # tight bands = range environment
-
+        bb_filter = bb_w < 0.06
         threshold = 0.50 if bb_filter else 0.70
 
         if buy_score >= threshold and buy_score > sell_score:

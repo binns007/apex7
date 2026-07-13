@@ -13,31 +13,25 @@ class SentimentAgent(BaseAgent):
 
     async def analyze(self, symbol, timeframe, df, extras) -> AgentSignal:
         fear_greed = extras.get("fear_greed", 50)
-        funding    = extras.get("funding_rate", {}).get(symbol, 0.0)
+        funding = extras.get("funding_rate", {}).get(symbol, 0.0)
 
         buy_score = sell_score = 0.0
 
-        # ── Fear & Greed Index ──────────────────────
-        # Contrarian extremes
-        if fear_greed <= 20:               # Extreme Fear → buy dip
+        if fear_greed <= 20:
             buy_score += 0.35
-        elif fear_greed <= 35:             # Fear
+        elif fear_greed <= 35:
             buy_score += 0.20
-        elif fear_greed >= 80:             # Extreme Greed → sell / caution
+        elif fear_greed >= 80:
             sell_score += 0.35
-        elif fear_greed >= 65:             # Greed
+        elif fear_greed >= 65:
             sell_score += 0.20
         else:
-            # Neutral 35–65: mild trend-following
             if fear_greed > 50:
                 buy_score += 0.10
             else:
                 sell_score += 0.10
 
-        # ── Funding Rate ────────────────────────────
-        # High positive funding = longs overcrowded → contrarian sell
-        # High negative funding = shorts overcrowded → contrarian buy
-        if funding > 0.0008:              # > ~0.08% per 8hr
+        if funding > 0.0008:
             sell_score += 0.25
         elif funding > 0.0003:
             sell_score += 0.12
@@ -45,7 +39,6 @@ class SentimentAgent(BaseAgent):
             buy_score += 0.25
         elif funding < -0.0003:
             buy_score += 0.12
-        # else near-zero: neutral, no adjustment
 
         threshold = 0.35
 

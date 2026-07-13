@@ -16,14 +16,13 @@ class OrderBookAgent(BaseAgent):
         if not ob:
             return self.hold(symbol, timeframe, "No order book data")
 
-        imbalance  = ob.get("imbalance", 0.0)   # -1 to +1
+        imbalance = ob.get("imbalance", 0.0)
         spread_pct = ob.get("spread_pct", 0.5)
-        bids       = ob.get("bids", [])
-        asks       = ob.get("asks", [])
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
 
         buy_score = sell_score = 0.0
 
-        # ── Imbalance signal ────────────────────────
         if imbalance > 0.30:
             buy_score += 0.35
         elif imbalance > 0.15:
@@ -33,29 +32,25 @@ class OrderBookAgent(BaseAgent):
         elif imbalance < -0.15:
             sell_score += 0.20
 
-        # ── Large wall detection ────────────────────
         if bids and asks:
             bid_vols = [q for _, q in bids]
             ask_vols = [q for _, q in asks]
             top_bid_wall = max(bid_vols[:5]) / (sum(bid_vols[:5]) + 1e-9)
             top_ask_wall = max(ask_vols[:5]) / (sum(ask_vols[:5]) + 1e-9)
 
-            # Large bid wall = support → buy signal
             if top_bid_wall > 0.5:
                 buy_score += 0.20
-            # Large ask wall = resistance → sell signal
             if top_ask_wall > 0.5:
                 sell_score += 0.20
 
-        # ── Spread filter: tight spread = liquid → trade confidently
         if spread_pct < 0.02:
             confidence_boost = 1.15
         elif spread_pct > 0.10:
-            confidence_boost = 0.80  # wide spread = risky
+            confidence_boost = 0.80
         else:
             confidence_boost = 1.0
 
-        buy_score  *= confidence_boost
+        buy_score *= confidence_boost
         sell_score *= confidence_boost
 
         threshold = 0.40

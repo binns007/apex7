@@ -1,12 +1,19 @@
 """
-APEX-7 Risk Manager  (fixed)
-═══════════════════
-Fixes:
-  • _reject() walrus-operator bug (`if side := "BUY"` was always truthy)
-  • portfolio_usdt guard: rejects cleanly when balance is $0 (API key bad)
-  • Added warn log when balance=0 so the root cause is visible immediately
+APEX-7 Risk Manager
+════════════════════
+Fixes vs v1:
+  - _reject() no longer has the walrus-operator side always defaulting
+    incorrectly; it always takes an explicit `side` parameter (this was
+    already patched in the file we inherited, kept here).
+  - NEW: NaN/zero guards on entry_price, stop_loss_pct, take_profit_pct
+    before they're used in division or price math. A NaN slipping in
+    from an indicator warmup period could previously have produced NaN
+    order parameters, propagated silently through `min()/max()` clamps.
+  - NEW: guards against non-positive stop_loss_pct which would otherwise
+    divide-by-near-zero and produce absurd position sizes.
 """
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -49,6 +56,24 @@ class RiskManager:
         portfolio_usdt: float,
         consensus_score: float,
     ) -> PositionSize:
+        # ── NaN / sanity guards (new) ─────────
+        for name, val in (
+            ("entry_price", entry_price),
+            ("stop_loss_pct", stop_loss_pct),
+            ("take_profit_pct", take_profit_pct),
+            ("portfolio_usdt", portfolio_usdt),
+            ("consensus_score", consensus_score),
+        ):
+            if val is None or (isinstance(val, float) and math.isnan(val)):
+                return self._reject(0.0, 0.01, 0.02, side, f"Invalid {name}: NaN/None")
+
+        if entry_price <= 0:
+            return self._reject(0.0, stop_loss_pct, take_profit_pct, side,
+                                 f"Invalid entry_price={entry_price}")
+        if stop_loss_pct <= 0:
+            return self._reject(entry_price, 0.01, take_profit_pct, side,
+                                 f"Invalid stop_loss_pct={stop_loss_pct}")
+
         # ── Guard: zero balance almost always means bad API key ──
         if portfolio_usdt < 1.0:
             logger.warning(
@@ -73,8 +98,7 @@ class RiskManager:
                 self.halted = True
                 self.halt_reason = f"Max drawdown {dd:.1f}% exceeded"
                 return self._reject(
-                    entry_price, stop_loss_pct, take_profit_pct, side,
-                    self.halt_reason
+                    entry_price, stop_loss_pct, take_profit_pct, side, self.halt_reason
                 )
 
         # ── Portfolio heat check ───────────────
@@ -105,20 +129,20 @@ class RiskManager:
         conviction_boost = 0.8 + consensus_score * 0.4
         risk_pct = min(risk_pct * conviction_boost, max_risk_pct * 1.3)
 
-        # Floor: if Kelly produces near-zero (< 10 trades) use the configured max
+        # Floor: with limited trade history, use half the configured max
+        # rather than letting an unproven Kelly estimate zero out sizing.
         if self._total_trades < 10:
             risk_pct = max(risk_pct, max_risk_pct * 0.5)
 
-        # ── Compute $ amounts ─────────────────
-        risk_usdt  = portfolio_usdt * risk_pct
+        risk_usdt = portfolio_usdt * risk_pct
         usdt_value = risk_usdt / (stop_loss_pct + 1e-9)
         usdt_value = min(usdt_value, settings.TRADE_USDT_CAP)
-        risk_usdt  = usdt_value * stop_loss_pct
+        risk_usdt = usdt_value * stop_loss_pct
 
-        if usdt_value < 10:
+        if usdt_value < settings.MIN_TRADE_USDT:
             return self._reject(
                 entry_price, stop_loss_pct, take_profit_pct, side,
-                f"Position too small (${usdt_value:.2f} < $10 USDT)"
+                f"Position too small (${usdt_value:.2f} < ${settings.MIN_TRADE_USDT} USDT)"
             )
 
         quantity = usdt_value / entry_price
@@ -162,6 +186,8 @@ class RiskManager:
             self._peak_value = self._current_value
 
     def update_portfolio_value(self, value: float):
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return
         self._current_value = value
         if value > self._peak_value:
             self._peak_value = value
@@ -208,23 +234,23 @@ class RiskManager:
             "open_positions": self.open_positions,
         }
 
-    # ─────────────────────────────────────────
-    #  FIX: _reject() — removed walrus bug, now takes explicit `side` param
-    # ─────────────────────────────────────────
     def _reject(
         self,
         entry: float,
         sl_pct: float,
         tp_pct: float,
-        side: str,          # ← was missing; walrus bug set this to "BUY" always
+        side: str,
         reason: str,
     ) -> PositionSize:
-        if side == "BUY":
-            sl_price = entry * (1 - sl_pct)
-            tp_price = entry * (1 + tp_pct)
-        else:
-            sl_price = entry * (1 + sl_pct)
-            tp_price = entry * (1 - tp_pct)
+        try:
+            if side == "BUY":
+                sl_price = entry * (1 - sl_pct)
+                tp_price = entry * (1 + tp_pct)
+            else:
+                sl_price = entry * (1 + sl_pct)
+                tp_price = entry * (1 - tp_pct)
+        except Exception:
+            sl_price = tp_price = 0.0
         logger.warning("❌ Position rejected: %s", reason)
         return PositionSize(
             quantity=0,

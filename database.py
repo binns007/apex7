@@ -1,12 +1,15 @@
 """
 APEX-7 Database Layer
 SQLite via SQLAlchemy — stores trades, signals, and performance snapshots.
+
+Changes vs v1: added indices on the columns actually queried
+(status, symbol, created_at/opened_at) since the API filters/sorts on
+these constantly as trade history grows.
 """
-import asyncio
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
-from sqlalchemy import String, Float, Integer, DateTime, Text, Boolean
+from sqlalchemy import String, Float, Integer, DateTime, Text, Boolean, Index
 
 
 DATABASE_URL = "sqlite+aiosqlite:///./data/apex7.db"
@@ -24,7 +27,7 @@ class Trade(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol: Mapped[str] = mapped_column(String(20))
-    side: Mapped[str] = mapped_column(String(10))          # "BUY" | "SELL"
+    side: Mapped[str] = mapped_column(String(10))
     entry_price: Mapped[float] = mapped_column(Float)
     exit_price: Mapped[float] = mapped_column(Float, nullable=True)
     quantity: Mapped[float] = mapped_column(Float)
@@ -33,7 +36,7 @@ class Trade(Base):
     take_profit: Mapped[float] = mapped_column(Float, nullable=True)
     pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)
     pnl_pct: Mapped[float] = mapped_column(Float, nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default="OPEN")  # OPEN | CLOSED | CANCELLED
+    status: Mapped[str] = mapped_column(String(20), default="OPEN")
     consensus_score: Mapped[float] = mapped_column(Float, nullable=True)
     agents_agree: Mapped[int] = mapped_column(Integer, nullable=True)
     regime: Mapped[str] = mapped_column(String(20), nullable=True)
@@ -43,6 +46,12 @@ class Trade(Base):
     closed_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
     notes: Mapped[str] = mapped_column(Text, nullable=True)
 
+    __table_args__ = (
+        Index("ix_trades_status", "status"),
+        Index("ix_trades_symbol", "symbol"),
+        Index("ix_trades_opened_at", "opened_at"),
+    )
+
 
 class AgentSignal(Base):
     __tablename__ = "agent_signals"
@@ -51,10 +60,16 @@ class AgentSignal(Base):
     symbol: Mapped[str] = mapped_column(String(20))
     timeframe: Mapped[str] = mapped_column(String(5))
     agent_name: Mapped[str] = mapped_column(String(50))
-    signal: Mapped[str] = mapped_column(String(10))       # "BUY" | "SELL" | "HOLD"
+    signal: Mapped[str] = mapped_column(String(10))
     confidence: Mapped[float] = mapped_column(Float)
     reason: Mapped[str] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index("ix_signals_symbol", "symbol"),
+        Index("ix_signals_created_at", "created_at"),
+        Index("ix_signals_agent_name", "agent_name"),
+    )
 
 
 class PerformanceSnapshot(Base):

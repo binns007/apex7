@@ -787,11 +787,15 @@ async function loadChart(){
     chartState.loaded=true;
     drawChart(chartState.candles);
     updateIndicators(d);
-    updateBalanceStat(d.price, sym);
+    updateBalanceStat();
   } catch(e){console.warn('Chart load failed',e)}
 }
-function updateBalanceStat(price,sym){
-  if(price) document.getElementById('statBalance').textContent=`$${price.toLocaleString('en',{maximumFractionDigits:4})}`;
+function updateBalanceStat(){
+  const status = lastStatus || {};
+  const balance = status.portfolio_usdt;
+  if(balance != null) {
+    document.getElementById('statBalance').textContent = `$${balance.toLocaleString('en',{maximumFractionDigits:2})}`;
+  }
 }
 function updateIndicators(d){
   const rsi=d.rsi;

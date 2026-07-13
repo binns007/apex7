@@ -2,6 +2,7 @@
 Agent 1 — Momentum Agent
 Uses RSI, MACD, EMA alignment, and Rate-of-Change to detect strong directional momentum.
 """
+import math
 import numpy as np
 import pandas as pd
 from agents.base_agent import BaseAgent, AgentSignal
@@ -18,17 +19,21 @@ class MomentumAgent(BaseAgent):
         last = df.iloc[-1]
         prev = df.iloc[-2]
 
-        rsi   = last["rsi"]
-        macd  = last["macd"]
-        sig   = last["macd_signal"]
-        hist  = last["macd_hist"]
-        roc   = last["roc_10"]
-        ema9  = last["ema_9"]
+        fields = [last["rsi"], last["macd"], last["macd_signal"], last["macd_hist"],
+                  last["roc_10"], last["ema_9"], last["ema_21"], last["ema_50"]]
+        if any(math.isnan(v) for v in fields):
+            return self.hold(symbol, timeframe, "Indicators still warming up")
+
+        rsi = last["rsi"]
+        macd = last["macd"]
+        sig = last["macd_signal"]
+        hist = last["macd_hist"]
+        roc = last["roc_10"]
+        ema9 = last["ema_9"]
         ema21 = last["ema_21"]
         ema50 = last["ema_50"]
         close = last["close"]
 
-        # ── Score accumulation ──────────────────────
         buy_score = 0.0
         sell_score = 0.0
 
@@ -64,7 +69,6 @@ class MomentumAgent(BaseAgent):
         elif roc < -1.5:
             sell_score += 0.15
 
-        # ── Decision ───────────────────────────────
         if buy_score >= 0.55 and buy_score > sell_score * 1.3:
             return self._signal(symbol, timeframe, "BUY", buy_score,
                 f"RSI={rsi:.1f} MACD_hist={hist:.4f} EMA_aligned ROC={roc:.2f}%")
