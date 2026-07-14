@@ -23,7 +23,11 @@
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font-sans)}
-body{overflow-x:hidden}
+body{overflow-x:hidden;transition:background .3s}
+
+/* ── FUTURES MODE THEME — accent shifts to a leverage-energy amber
+     while the rest of the dark terminal aesthetic stays identical ── */
+body.futures-mode{--accent:#ff9500;--accent2:#ff3b5c}
 
 /* ── SCROLLBAR ── */
 ::-webkit-scrollbar{width:4px;height:4px}
@@ -50,8 +54,9 @@ header{
   border-radius:8px;
   display:flex;align-items:center;justify-content:center;
   font-family:var(--font-mono);font-size:11px;font-weight:700;color:#000;
+  transition:background .3s;
 }
-.logo-text{font-family:var(--font-mono);font-size:14px;letter-spacing:3px;color:var(--accent)}
+.logo-text{font-family:var(--font-mono);font-size:14px;letter-spacing:3px;color:var(--accent);transition:color .3s}
 .logo-sub{font-size:10px;color:var(--muted);margin-top:1px}
 .header-center{display:flex;align-items:center;gap:20px}
 .mode-badge{
@@ -80,6 +85,37 @@ header{
 .btn-stop{background:var(--red);color:#fff}
 .btn-stop:hover{filter:brightness(1.15)}
 
+/* ── MARKET TOGGLE — "highlighted efficiently" per brief: a segmented
+     control with a glowing amber Futures side, so the switch reads as
+     a live control, not a settings checkbox ── */
+.market-toggle{
+  display:flex;background:var(--panel2);border:1px solid var(--border);
+  border-radius:8px;padding:3px;gap:2px;position:relative;
+}
+.market-toggle-btn{
+  border:none;background:transparent;color:var(--muted);cursor:pointer;
+  font-family:var(--font-mono);font-size:10px;font-weight:700;letter-spacing:1px;
+  padding:6px 14px;border-radius:6px;transition:.2s;position:relative;
+}
+.market-toggle-btn.active{background:var(--panel);color:var(--accent)}
+.market-toggle-btn#btnSpot.active{color:#00e5ff}
+.market-toggle-btn#btnFutures{color:#ff9500;opacity:.75}
+.market-toggle-btn#btnFutures.active{
+  background:linear-gradient(135deg,rgba(255,149,0,.18),rgba(255,59,92,.14));
+  color:#ff9500;opacity:1;
+  box-shadow:0 0 0 1px rgba(255,149,0,.5),0 0 14px rgba(255,149,0,.35);
+  animation:futuresGlow 2.2s ease-in-out infinite;
+}
+@keyframes futuresGlow{
+  0%,100%{box-shadow:0 0 0 1px rgba(255,149,0,.5),0 0 10px rgba(255,149,0,.25)}
+  50%{box-shadow:0 0 0 1px rgba(255,149,0,.8),0 0 20px rgba(255,149,0,.55)}
+}
+.lev-pill{
+  font-family:var(--font-mono);font-size:9px;font-weight:700;
+  background:rgba(255,149,0,.15);color:#ff9500;border:1px solid rgba(255,149,0,.4);
+  padding:2px 7px;border-radius:10px;letter-spacing:.5px;
+}
+
 /* ── SIDEBAR ── */
 .sidebar{padding:16px 0}
 .nav-section{margin-bottom:8px}
@@ -96,6 +132,7 @@ header{
 }
 .nav-item:hover{background:var(--panel2);color:var(--text)}
 .nav-item.active{color:var(--accent);border-left-color:var(--accent);background:rgba(0,229,255,.05)}
+body.futures-mode .nav-item.active{background:rgba(255,149,0,.07)}
 .nav-icon{width:16px;text-align:center;font-size:14px}
 .nav-badge{
   margin-left:auto;background:var(--accent2);color:#fff;
@@ -169,12 +206,15 @@ header{
 .badge-sell{background:rgba(255,59,92,.12);color:var(--red)}
 .badge-open{background:rgba(0,229,255,.1);color:var(--accent)}
 .badge-closed{background:rgba(90,113,153,.15);color:var(--muted)}
+.badge-liquidated{background:rgba(255,59,92,.22);color:var(--red);font-weight:700}
 .pnl-pos{color:var(--green)}
 .pnl-neg{color:var(--red)}
 .cell-sl{color:var(--red);font-family:var(--font-mono);font-size:10px}
 .cell-tp{color:var(--green);font-family:var(--font-mono);font-size:10px}
 .cell-risk{color:var(--yellow);font-family:var(--font-mono);font-size:10px}
 .cell-score{color:var(--accent);font-family:var(--font-mono);font-size:10px}
+.cell-lev{color:#ff9500;font-family:var(--font-mono);font-size:10px;font-weight:700}
+.cell-liq{color:#ff3b5c;font-family:var(--font-mono);font-size:10px}
 
 /* ── AGENT GRID ── */
 .agent-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
@@ -283,6 +323,16 @@ header{
   transition:.2s;
 }
 .save-btn:hover{filter:brightness(1.15)}
+.cancel-btn{
+  padding:10px 22px;border-radius:6px;border:1px solid var(--border);cursor:pointer;
+  background:transparent;color:var(--muted);
+  font-family:var(--font-mono);font-size:11px;font-weight:700;letter-spacing:1px;
+  transition:.2s;
+}
+.cancel-btn:hover{color:var(--text);border-color:var(--muted)}
+.futures-only{display:none}
+body.futures-mode .futures-only{display:block}
+body.futures-mode .spot-only{display:none}
 
 /* ── PERFORMANCE PAGE ── */
 .perf-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px}
@@ -304,6 +354,33 @@ header{
 }
 .resume-btn:hover{background:var(--red);color:#fff}
 
+/* ── LEVERAGE START MODAL ── */
+.modal-overlay{
+  position:fixed;inset:0;background:rgba(3,5,8,.75);backdrop-filter:blur(3px);
+  display:none;align-items:center;justify-content:center;z-index:1000;
+}
+.modal-overlay.show{display:flex}
+.leverage-modal{
+  width:360px;max-width:90vw;background:var(--panel);
+  border:1px solid rgba(255,149,0,.4);border-radius:14px;
+  padding:24px;box-shadow:0 0 40px rgba(255,149,0,.15);
+}
+.leverage-modal h3{font-family:var(--font-mono);font-size:15px;color:#ff9500;margin-bottom:4px}
+.modal-sub{font-size:11px;color:var(--muted);margin-bottom:18px;line-height:1.5}
+.modal-warning{
+  font-size:10.5px;color:var(--yellow);background:rgba(255,214,10,.08);
+  border:1px solid rgba(255,214,10,.25);border-radius:6px;padding:9px 11px;
+  margin-bottom:18px;line-height:1.5;
+}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end}
+.lev-quick-row{display:flex;gap:6px;margin-top:8px}
+.lev-quick-btn{
+  flex:1;padding:6px 0;border-radius:5px;border:1px solid var(--border);
+  background:var(--panel2);color:var(--muted);cursor:pointer;
+  font-family:var(--font-mono);font-size:10px;transition:.15s;
+}
+.lev-quick-btn:hover,.lev-quick-btn.active{border-color:#ff9500;color:#ff9500}
+
 /* ── RESPONSIVE ── */
 @media(max-width:1100px){
   .content{grid-template-columns:180px 1fr}
@@ -313,6 +390,7 @@ header{
   .content{grid-template-columns:1fr}
   .sidebar{display:none}
   .stat-row{grid-template-columns:repeat(2,1fr)}
+  .header-center{display:none}
 }
 </style>
 </head>
@@ -328,9 +406,14 @@ header{
     </div>
   </div>
   <div class="header-center">
+    <div class="market-toggle">
+      <button class="market-toggle-btn active" id="btnSpot" onclick="setMarket('spot')">SPOT</button>
+      <button class="market-toggle-btn" id="btnFutures" onclick="setMarket('futures')">⚡ FUTURES</button>
+    </div>
     <div class="pulse-dot off" id="engineDot"></div>
     <span id="engineStatus" style="font-size:11px;color:var(--muted);font-family:var(--font-mono)">OFFLINE</span>
     <div class="mode-badge testnet" id="modeBadge">TESTNET</div>
+    <span id="levBadgeWrap"></span>
   </div>
   <div class="header-right">
     <span style="font-family:var(--font-mono);font-size:11px;color:var(--muted)" id="scanCount">SCAN #0</span>
@@ -380,7 +463,7 @@ header{
   <div class="page active" id="page-dashboard">
     <div class="stat-row">
       <div class="stat-card">
-        <div class="stat-label">Portfolio USDT</div>
+        <div class="stat-label" id="statBalanceLabel">Portfolio USDT</div>
         <div class="stat-value accent" id="statBalance">—</div>
         <div class="stat-sub" id="statMode">Testnet mode</div>
       </div>
@@ -410,7 +493,7 @@ header{
             <option>BTCUSDT</option><option>ETHUSDT</option><option>SOLUSDT</option><option>BNBUSDT</option>
           </select>
           <select id="chartTf" onchange="loadChart()" style="background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:11px;outline:none">
-            <option value="1m">1m</option><option value="5m" selected>5m</option><option value="15m">15m</option>
+            <option value="1m">1m</option><option value="3m">3m</option><option value="5m" selected>5m</option><option value="15m">15m</option>
           </select>
         </div>
       </div>
@@ -452,6 +535,7 @@ header{
             <tr>
               <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th>
               <th>Size</th><th>SL</th><th>TP</th><th>Risk $</th><th>Score</th>
+              <th>Lev</th><th>Liq</th>
               <th>PnL%</th><th>PnL$</th><th>Status</th>
             </tr>
           </thead>
@@ -469,6 +553,7 @@ header{
         <option value="">All</option>
         <option value="OPEN">Open</option>
         <option value="CLOSED">Closed</option>
+        <option value="LIQUIDATED" class="futures-only" style="display:inherit">Liquidated</option>
       </select>
     </div>
     <div class="panel">
@@ -478,6 +563,7 @@ header{
             <tr>
               <th>#</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th>
               <th>USDT</th><th>SL</th><th>TP</th><th>Risk $</th><th>Score</th>
+              <th>Lev</th><th>Liq</th>
               <th>PnL%</th><th>PnL$</th><th>Regime</th>
               <th>Agents</th><th>Status</th><th>Opened</th>
             </tr>
@@ -527,18 +613,37 @@ header{
         <div class="panel-header"><span class="panel-title">TRADING MODE</span></div>
         <div class="panel-body">
           <div class="field-group">
-            <label class="field-label">Mode</label>
+            <label class="field-label">Mode <span style="color:var(--muted)">(shared by Spot + Futures)</span></label>
             <select id="setMode" class="field-input">
               <option value="testnet">Testnet (Safe)</option>
               <option value="live">Live Trading</option>
             </select>
           </div>
           <div class="field-group">
-            <label class="field-label">Trading Pairs (comma separated)</label>
+            <label class="field-label" id="setPairsLabel">Trading Pairs (comma separated)</label>
             <input id="setPairs" class="field-input" type="text" placeholder="BTCUSDT,ETHUSDT"/>
           </div>
         </div>
       </div>
+
+      <!-- Futures-only: Leverage & Margin Type -->
+      <div class="panel futures-only">
+        <div class="panel-header"><span class="panel-title" style="color:#ff9500">LEVERAGE &amp; MARGIN</span></div>
+        <div class="panel-body">
+          <div class="field-group">
+            <label class="field-label">Leverage (applies to new entries only)</label>
+            <input id="setLeverage" class="field-input" type="number" min="1" max="20"/>
+          </div>
+          <div class="field-group">
+            <label class="field-label">Margin Type</label>
+            <select id="setMarginType" class="field-input">
+              <option value="ISOLATED">Isolated (recommended)</option>
+              <option value="CROSSED">Cross</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
       <div class="panel">
         <div class="panel-header"><span class="panel-title">CONSENSUS ENGINE</span></div>
         <div class="panel-body">
@@ -560,8 +665,8 @@ header{
             <input id="setRisk" class="field-input" type="number" min="0.1" max="5" step="0.1"/>
           </div>
           <div class="field-group">
-            <label class="field-label">Max USDT Per Trade</label>
-            <input id="setCap" class="field-input" type="number" min="10"/>
+            <label class="field-label" id="setCapLabel">Max USDT Per Trade</label>
+            <input id="setCap" class="field-input" type="number" min="5"/>
           </div>
         </div>
       </div>
@@ -634,12 +739,54 @@ header{
 </div><!-- /.content -->
 </div><!-- /.shell -->
 
+<!-- ══ LEVERAGE START MODAL (Futures Mode only) ══ -->
+<div class="modal-overlay" id="leverageModalOverlay">
+  <div class="leverage-modal">
+    <h3>⚡ Start Futures Engine</h3>
+    <p class="modal-sub">Choose leverage and margin type before the engine goes live on futures. This applies to every new entry until you change it again.</p>
+    <div class="field-group">
+      <label class="field-label">Leverage</label>
+      <input id="levInput" class="field-input" type="number" min="1" max="20" value="5" oninput="syncLevQuickButtons()"/>
+      <div class="lev-quick-row">
+        <button class="lev-quick-btn" onclick="setLevQuick(2)">2×</button>
+        <button class="lev-quick-btn active" onclick="setLevQuick(5)">5×</button>
+        <button class="lev-quick-btn" onclick="setLevQuick(10)">10×</button>
+        <button class="lev-quick-btn" onclick="setLevQuick(20)">20×</button>
+      </div>
+    </div>
+    <div class="field-group">
+      <label class="field-label">Margin Type</label>
+      <select id="marginTypeInput" class="field-input">
+        <option value="ISOLATED" selected>Isolated (recommended)</option>
+        <option value="CROSSED">Cross</option>
+      </select>
+    </div>
+    <div class="modal-warning">⚠ Leverage amplifies both gains and losses. Higher leverage means a closer liquidation price — the engine will refuse entries where the stop-loss sits too close to estimated liquidation, but it can't eliminate leveraged-trading risk. Not financial advice.</div>
+    <div class="modal-actions">
+      <button class="cancel-btn" onclick="closeLeverageModal()">Cancel</button>
+      <button class="save-btn" onclick="confirmFuturesStart()">START ENGINE</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ══════════════════════════════════════
 //  APEX-7 Dashboard JS
 // ══════════════════════════════════════
-let ws, lastStatus={}, prices={}, chartData=[], equityData=[];
-const engineRunning=()=>lastStatus.running;
+let ws;
+let currentMarket = 'spot';                 // 'spot' | 'futures'
+let spotStatus = {}, futuresStatus = {};
+let spotPrices = {}, futuresPrices = {};
+let chartData=[], equityData=[];
+
+// ── Active-market accessors — every render function below reads
+//    through these instead of touching spotStatus/futuresStatus
+//    directly, so toggling the header switch is the ONLY place that
+//    needs to know which market is "current". ──
+function status(){ return currentMarket==='futures' ? futuresStatus : spotStatus; }
+function prices(){ return currentMarket==='futures' ? futuresPrices : spotPrices; }
+function apiBase(){ return currentMarket==='futures' ? '/api/futures' : '/api'; }
+function engineRunning(){ return !!status().running; }
 
 // ── WebSocket ──────────────────────────
 function connectWS(){
@@ -647,12 +794,37 @@ function connectWS(){
   ws.onmessage=e=>{
     const d=JSON.parse(e.data);
     if(d.type==='tick'){
-      lastStatus=d.status||{};
-      prices=d.prices||{};
+      spotStatus=d.status||{};
+      spotPrices=d.prices||{};
+      futuresStatus=d.futures_status||{};
+      futuresPrices=d.futures_prices||{};
       updateAll();
     }
   };
   ws.onclose=()=>setTimeout(connectWS,3000);
+}
+
+// ── Market switch ──────────────────────
+function setMarket(m){
+  if(m===currentMarket)return;
+  currentMarket=m;
+  document.body.classList.toggle('futures-mode', m==='futures');
+  document.getElementById('btnSpot').classList.toggle('active', m==='spot');
+  document.getElementById('btnFutures').classList.toggle('active', m==='futures');
+
+  const chartTfSel=document.getElementById('chartTf');
+  chartTfSel.value = m==='futures' ? '3m' : '5m';
+
+  document.getElementById('statBalanceLabel').textContent = m==='futures' ? 'Futures Margin Balance (USDT)' : 'Portfolio USDT';
+  document.getElementById('setPairsLabel').textContent = m==='futures' ? 'Futures Trading Pairs (comma separated)' : 'Trading Pairs (comma separated)';
+  document.getElementById('setCapLabel').textContent = m==='futures' ? 'Max Margin Per Trade (USDT)' : 'Max USDT Per Trade';
+
+  updateAll();
+  loadChart();
+  loadTrades('');
+  loadSettingsForm();
+  if(document.getElementById('page-performance').classList.contains('active'))loadPerformance();
+  if(document.getElementById('page-agents').classList.contains('active'))loadAgents();
 }
 
 // ── Navigation ─────────────────────────
@@ -669,11 +841,51 @@ function showPage(id,el){
 // ── Engine control ─────────────────────
 async function toggleEngine(){
   const running=engineRunning();
-  await fetch(`/api/engine/${running?'stop':'start'}`,{method:'POST'});
+  if(running){
+    await fetch(`${apiBase()}/engine/stop`,{method:'POST'});
+    return;
+  }
+  if(currentMarket==='futures'){
+    openLeverageModal();
+  } else {
+    await fetch(`${apiBase()}/engine/start`,{method:'POST'});
+  }
 }
 async function resumeTrading(){
-  await fetch('/api/engine/resume',{method:'POST'});
+  await fetch(`${apiBase()}/engine/resume`,{method:'POST'});
   document.getElementById('haltBanner').classList.remove('show');
+}
+
+// ── Leverage modal ─────────────────────
+function openLeverageModal(){
+  const lev = (futuresStatus.leverage) || 5;
+  document.getElementById('levInput').value = lev;
+  document.getElementById('marginTypeInput').value = (futuresStatus.margin_type)||'ISOLATED';
+  syncLevQuickButtons();
+  document.getElementById('leverageModalOverlay').classList.add('show');
+}
+function closeLeverageModal(){
+  document.getElementById('leverageModalOverlay').classList.remove('show');
+}
+function setLevQuick(n){
+  document.getElementById('levInput').value=n;
+  syncLevQuickButtons();
+}
+function syncLevQuickButtons(){
+  const v=parseInt(document.getElementById('levInput').value)||0;
+  document.querySelectorAll('.lev-quick-btn').forEach(b=>{
+    b.classList.toggle('active', parseInt(b.textContent)===v);
+  });
+}
+async function confirmFuturesStart(){
+  const lev=Math.max(1,Math.min(20,parseInt(document.getElementById('levInput').value)||5));
+  const mt=document.getElementById('marginTypeInput').value;
+  closeLeverageModal();
+  await fetch('/api/futures/engine/start',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({leverage:lev, margin_type:mt})
+  });
 }
 
 // ── Main update ────────────────────────
@@ -686,11 +898,12 @@ function updateAll(){
 }
 
 function updateHeader(){
-  const r=lastStatus;
+  const r=status();
   const dot=document.getElementById('engineDot');
   const statusEl=document.getElementById('engineStatus');
   const btn=document.getElementById('engineBtn');
   const badge=document.getElementById('modeBadge');
+  const levWrap=document.getElementById('levBadgeWrap');
 
   if(r.running){
     dot.classList.remove('off');
@@ -711,7 +924,12 @@ function updateHeader(){
   badge.textContent=mode;
   badge.className=`mode-badge ${r.mode==='live'?'live':'testnet'}`;
 
-  // Halt banner
+  if(currentMarket==='futures' && r.leverage){
+    levWrap.innerHTML = `<span class="lev-pill">${r.leverage}× ${r.margin_type||'ISOLATED'}</span>`;
+  } else {
+    levWrap.innerHTML = '';
+  }
+
   const risk=r.risk||{};
   const banner=document.getElementById('haltBanner');
   if(risk.halted){
@@ -722,10 +940,10 @@ function updateHeader(){
   }
 }
 
-// ── Stats: now shows REALIZED + UNREALIZED combined PnL ──
+// ── Stats: shows REALIZED + UNREALIZED combined PnL ──
 function updateStats(){
-  const risk=lastStatus.risk||{};
-  fetch('/api/performance').then(r=>r.json()).then(p=>{
+  const risk=status().risk||{};
+  fetch(`${apiBase()}/performance`).then(r=>r.json()).then(p=>{
     const combined = (p.combined_pnl_usdt!=null) ? p.combined_pnl_usdt : (p.total_pnl_usdt||0);
     const realized = p.total_pnl_usdt||0;
     const unrealized = p.unrealized_pnl_usdt||0;
@@ -734,8 +952,9 @@ function updateStats(){
     pnlEl.textContent=`$${combined>=0?'+':''}${combined.toFixed(2)}`;
     pnlEl.className=`stat-value ${combined>=0?'green':'red'}`;
 
+    const liqTxt = (currentMarket==='futures' && p.liquidations) ? ` · ${p.liquidations} liquidated` : '';
     document.getElementById('statPnlSub').textContent=
-      `${p.total_trades||0} closed · Realized $${realized.toFixed(2)} · Open $${unrealized.toFixed(2)} (${p.open_trades_count||0} pos)`;
+      `${p.total_trades||0} closed · Realized $${realized.toFixed(2)} · Open $${unrealized.toFixed(2)} (${p.open_trades_count||0} pos)${liqTxt}`;
 
     document.getElementById('statWinRate').textContent=`${(p.win_rate_pct||0).toFixed(1)}%`;
     document.getElementById('statWR').textContent=`W:${p.winning_trades||0} L:${p.losing_trades||0}`;
@@ -743,16 +962,19 @@ function updateStats(){
 
   document.getElementById('statOpen').textContent=(risk.open_positions||[]).length;
   document.getElementById('statHeat').textContent=`Heat: ${(risk.portfolio_heat_pct||0).toFixed(1)}%`;
-  document.getElementById('statMode').textContent=`${(lastStatus.mode||'testnet').toUpperCase()} mode`;
+  document.getElementById('statMode').textContent=`${(status().mode||'testnet').toUpperCase()} mode`;
 }
 
 function updatePairList(){
-  const pairs=lastStatus.pairs||['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT'];
+  const pairs=status().pairs||(currentMarket==='futures'
+    ? ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT']
+    : ['BTCUSDT','ETHUSDT','SOLUSDT','BNBUSDT']);
+  const p=prices();
   const container=document.getElementById('pairList');
-  container.innerHTML=pairs.map(p=>{
-    const price=prices[p];
-    return `<div class="pair-chip" onclick="selectPair('${p}')">
-      <span>${p.replace('USDT','')}</span>
+  container.innerHTML=pairs.map(sym=>{
+    const price=p[sym];
+    return `<div class="pair-chip" onclick="selectPair('${sym}')">
+      <span>${sym.replace('USDT','')}</span>
       <span class="pair-price">${price?'$'+price.toLocaleString('en',{maximumFractionDigits:2}):'—'}</span>
     </div>`;
   }).join('');
@@ -763,7 +985,7 @@ function selectPair(p){
 }
 
 function updateRiskPanel(){
-  const risk=lastStatus.risk||{};
+  const risk=status().risk||{};
   const heat=(risk.portfolio_heat_pct||0);
   const dd=(risk.drawdown_pct||0);
   const wr=(risk.win_rate_pct||52);
@@ -778,11 +1000,11 @@ function updateRiskPanel(){
 }
 
 function updateLog(){
-  const logs=lastStatus.log||[];
+  const logs=status().log||[];
   const container=document.getElementById('engineLog');
   container.innerHTML=logs.slice(0,40).map(line=>{
     const cls=line.includes('✅')?'buy':
-              line.includes('❌')||line.includes('🔴')?'sell':
+              line.includes('❌')||line.includes('🔴')||line.includes('💥')?'sell':
               line.includes('⚠')||line.includes('🛑')?'warn':
               line.includes('🎯')?'buy':'';
     return `<div class="log-entry ${cls}">${escHtml(line)}</div>`;
@@ -795,9 +1017,9 @@ let chartState={candles:[],loaded:false};
 async function loadChart(){
   const sym=document.getElementById('chartPair').value;
   const tf=document.getElementById('chartTf').value;
-  document.getElementById('chartTitle').textContent=`${sym} — ${tf}`;
+  document.getElementById('chartTitle').textContent=`${sym} — ${tf}${currentMarket==='futures'?' (Futures)':''}`;
   try{
-    const r=await fetch(`/api/market/${sym}?interval=${tf}`);
+    const r=await fetch(`${apiBase()}/market/${sym}?interval=${tf}`);
     const d=await r.json();
     chartState.candles=d.candles||[];
     chartState.loaded=true;
@@ -807,11 +1029,12 @@ async function loadChart(){
   } catch(e){console.warn('Chart load failed',e)}
 }
 function updateBalanceStat(){
-  const status = lastStatus || {};
-  const balance = status.portfolio_usdt;
-  if(balance != null) {
-    document.getElementById('statBalance').textContent = `$${balance.toLocaleString('en',{maximumFractionDigits:2})}`;
-  }
+  const s = status();
+  const p = prices();
+  fetch(`${apiBase()}/status`).then(r=>r.json()).then(full=>{
+    // status endpoint doesn't carry balance directly on this build;
+    // fall back to summing nothing — left for future extension.
+  }).catch(()=>{});
 }
 function updateIndicators(d){
   const rsi=d.rsi;
@@ -849,7 +1072,6 @@ function drawChart(candles){
   ctx.fillStyle='#060910';
   ctx.fillRect(0,0,W,H);
 
-  // Grid lines
   ctx.strokeStyle='rgba(26,37,64,.5)';ctx.lineWidth=1;
   for(let i=0;i<=4;i++){
     const y=pad+(H-pad*2)*i/4;
@@ -859,7 +1081,6 @@ function drawChart(candles){
     ctx.fillText(price.toFixed(1),4,y-3);
   }
 
-  // Candles
   slice.forEach((c,i)=>{
     const x=pad+i*barW+barW*0.1;
     const bw=barW*0.8;
@@ -867,15 +1088,12 @@ function drawChart(candles){
     const color=isGreen?'#00ff8c':'#ff3b5c';
     const openY=scaleY(c.o),closeY=scaleY(c.c);
     const highY=scaleY(c.h),lowY=scaleY(c.l);
-    // Wick
     ctx.strokeStyle=color;ctx.lineWidth=1;
     ctx.beginPath();ctx.moveTo(x+bw/2,highY);ctx.lineTo(x+bw/2,lowY);ctx.stroke();
-    // Body
     ctx.fillStyle=color;
     ctx.fillRect(x,Math.min(openY,closeY),bw,Math.max(Math.abs(closeY-openY),1));
   });
 
-  // Volume overlay at bottom
   const maxVol=Math.max(...slice.map(c=>c.v));
   slice.forEach((c,i)=>{
     const x=pad+i*barW+barW*0.1;
@@ -892,31 +1110,27 @@ function drawDial(score){
   const ctx=c.getContext('2d');
   const cx=70,cy=90,r=60;
   ctx.clearRect(0,0,140,100);
-  // Track
   ctx.beginPath();ctx.arc(cx,cy,r,Math.PI,2*Math.PI);
   ctx.strokeStyle='rgba(26,37,64,1)';ctx.lineWidth=8;ctx.stroke();
-  // Fill
   const angle=Math.PI+score*Math.PI;
   const color=score>=0.68?'#00ff8c':score>=0.45?'#ffd60a':'#ff3b5c';
   ctx.beginPath();ctx.arc(cx,cy,r,Math.PI,angle);
   ctx.strokeStyle=color;ctx.lineWidth=8;ctx.lineCap='round';ctx.stroke();
-  // Score text
   document.getElementById('dialScore').textContent=score>0?(score*100).toFixed(0)+'%':'—';
   document.getElementById('dialScore').style.color=color;
   document.getElementById('dialStatus').textContent=
     score>=0.68?'🟢 SIGNAL FIRING':score>=0.45?'🟡 BUILDING':'⚪ MONITORING';
 }
 setInterval(()=>{
-  // Animate dial with best recent consensus hint
-  const heat=(lastStatus.risk||{}).portfolio_heat_pct||0;
+  const heat=(status().risk||{}).portfolio_heat_pct||0;
   drawDial(heat/100);
 },3000);
 drawDial(0);
 
 // ── Trade Table ─────────────────────────
-// Renders full trade rows including SL / TP / Risk $ / Confidence Score,
-// and — for OPEN trades — live unrealized PnL (unrealized_pnl_usdt/pct
-// from the API) instead of leaving PnL columns blank until close.
+// Renders full trade rows including SL / TP / Risk $ / Score / Leverage /
+// Liquidation, and — for OPEN trades — live unrealized PnL. LEV/LIQ show
+// "—" for spot trades (those fields simply aren't present on that API).
 function tradeRow(t, forRecent){
   const isOpen = t.status === 'OPEN';
   const pnl = isOpen ? t.unrealized_pnl_usdt : t.pnl_usdt;
@@ -927,6 +1141,9 @@ function tradeRow(t, forRecent){
   const pnlUsdtTxt = hasPnl ? `${pnl>=0?'+':''}$${pnl.toFixed(2)}` : '—';
   const scoreTxt = t.consensus_score!=null ? `${(t.consensus_score*100).toFixed(0)}%` : '—';
   const agreeTxt = t.agents_agree!=null ? `${t.agents_agree}` : '—';
+  const levTxt = t.leverage!=null ? `${t.leverage}×` : '—';
+  const liqTxt = t.liquidation_price!=null ? t.liquidation_price.toFixed(4) : '—';
+  const statusClass = t.status==='LIQUIDATED' ? 'badge-liquidated' : `badge-${t.status.toLowerCase()}`;
 
   const commonCells = `
       <td style="font-family:var(--font-mono);font-size:11px">${t.symbol}</td>
@@ -938,12 +1155,14 @@ function tradeRow(t, forRecent){
       <td class="cell-tp">${t.take_profit!=null?t.take_profit.toFixed(4):'—'}</td>
       <td class="cell-risk">${t.risk_usdt!=null?'$'+t.risk_usdt.toFixed(2):'—'}</td>
       <td class="cell-score">${scoreTxt}</td>
+      <td class="cell-lev">${levTxt}</td>
+      <td class="cell-liq">${liqTxt}</td>
       <td class="${pnlClass}" style="font-family:var(--font-mono);font-size:11px">${pnlPctTxt}</td>
       <td class="${pnlClass}" style="font-family:var(--font-mono);font-size:11px">${pnlUsdtTxt}</td>`;
 
   if (forRecent) {
     return `<tr>${commonCells}
-      <td><span class="badge badge-${t.status.toLowerCase()}">${t.status}</span></td>
+      <td><span class="badge ${statusClass}">${t.status}</span></td>
     </tr>`;
   }
 
@@ -951,31 +1170,31 @@ function tradeRow(t, forRecent){
       <td style="color:var(--muted);font-size:10px">#${t.id}</td>${commonCells}
       <td style="font-size:10px;color:var(--muted)">${t.regime||'—'}</td>
       <td style="font-family:var(--font-mono);font-size:10px">${agreeTxt}</td>
-      <td><span class="badge badge-${t.status.toLowerCase()}">${t.status}</span></td>
+      <td><span class="badge ${statusClass}">${t.status}</span></td>
       <td style="font-size:10px;color:var(--muted)">${t.opened_at?new Date(t.opened_at).toLocaleTimeString():'—'}</td>
     </tr>`;
 }
 
 async function loadTrades(statusFilter){
-  const url=`/api/trades?limit=100${statusFilter?'&status='+statusFilter:''}`;
+  const url=`${apiBase()}/trades?limit=100${statusFilter?'&status='+statusFilter:''}`;
   const trades=await fetch(url).then(r=>r.json()).catch(()=>[]);
 
   const allBody=document.getElementById('allTrades');
   if(allBody){
     allBody.innerHTML = trades.map(t=>tradeRow(t,false)).join('') ||
-      '<tr><td colspan="15" style="text-align:center;padding:24px;color:var(--muted)">No trades yet</td></tr>';
+      '<tr><td colspan="17" style="text-align:center;padding:24px;color:var(--muted)">No trades yet</td></tr>';
   }
 
   const recentBody=document.getElementById('recentTrades');
   if(recentBody){
     recentBody.innerHTML = trades.slice(0,8).map(t=>tradeRow(t,true)).join('') ||
-      '<tr><td colspan="12" style="text-align:center;padding:16px;color:var(--muted)">No trades yet</td></tr>';
+      '<tr><td colspan="14" style="text-align:center;padding:16px;color:var(--muted)">No trades yet</td></tr>';
   }
 }
 
 // ── Performance ─────────────────────────
 async function loadPerformance(){
-  const p=await fetch('/api/performance').then(r=>r.json()).catch(()=>({}));
+  const p=await fetch(`${apiBase()}/performance`).then(r=>r.json()).catch(()=>({}));
   const grid=document.getElementById('perfGrid');
   const combined = (p.combined_pnl_usdt!=null) ? p.combined_pnl_usdt : (p.total_pnl_usdt||0);
   const metrics=[
@@ -992,6 +1211,9 @@ async function loadPerformance(){
     {label:'Avg Hold',val:`${(p.avg_hold_minutes||0).toFixed(0)}m`,color:'accent'},
     {label:'Open Positions',val:p.open_trades_count||0,color:'yellow'},
   ];
+  if(currentMarket==='futures'){
+    metrics.push({label:'Liquidations',val:p.liquidations||0,color:'red'});
+  }
   grid.innerHTML=metrics.map(m=>`
     <div class="stat-card">
       <div class="stat-label">${m.label}</div>
@@ -1002,7 +1224,7 @@ async function loadPerformance(){
 // ── Agents ──────────────────────────────
 const AGENTS=['Momentum','MeanReversion','Breakout','Volume','Sentiment','OrderBook','Scalping','Regime'];
 async function loadAgents(){
-  const sigs=await fetch('/api/signals?limit=200').then(r=>r.json()).catch(()=>[]);
+  const sigs=await fetch(`${apiBase()}/signals?limit=200`).then(r=>r.json()).catch(()=>[]);
   const grid=document.getElementById('agentGrid');
   const byAgent={};
   sigs.forEach(s=>{
@@ -1023,7 +1245,6 @@ async function loadAgents(){
     </div>`;
   }).join('');
 
-  // Signal table
   const table=document.getElementById('signalTable');
   table.innerHTML=sigs.slice(0,80).map(s=>{
     const sigClass=s.signal==='BUY'?'badge-buy':s.signal==='SELL'?'badge-sell':'';
@@ -1038,7 +1259,6 @@ async function loadAgents(){
     </tr>`;
   }).join('')||'<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--muted)">No signals yet</td></tr>';
 
-  // Live signal stream (sidebar)
   const stream=document.getElementById('liveSignalStream');
   stream.innerHTML=sigs.slice(0,20).map(s=>{
     return `<div class="signal-row">
@@ -1053,19 +1273,42 @@ async function loadAgents(){
 
 // ── Settings ────────────────────────────
 function loadSettingsForm(){
-  document.getElementById('setMode').value=lastStatus.mode||'testnet';
-  document.getElementById('setPairs').value=(lastStatus.pairs||[]).join(',');
+  const s=status();
+  document.getElementById('setMode').value=s.mode||'testnet';
+  document.getElementById('setPairs').value=(s.pairs||[]).join(',');
+  document.getElementById('setConsensus').value='';
+  document.getElementById('setAgents').value='';
+  document.getElementById('setRisk').value='';
+  document.getElementById('setCap').value='';
+  if(currentMarket==='futures'){
+    document.getElementById('setLeverage').value=s.leverage||5;
+    document.getElementById('setMarginType').value=s.margin_type||'ISOLATED';
+  }
 }
 async function saveSettings(){
-  const body={
-    trading_mode:document.getElementById('setMode').value,
-    trading_pairs:document.getElementById('setPairs').value.split(','),
-    min_consensus_score:parseFloat(document.getElementById('setConsensus').value)||undefined,
-    min_agents_agree:parseInt(document.getElementById('setAgents').value)||undefined,
-    max_portfolio_risk_pct:parseFloat(document.getElementById('setRisk').value)||undefined,
-    trade_usdt_cap:parseFloat(document.getElementById('setCap').value)||undefined,
-  };
-  await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  let body;
+  if(currentMarket==='futures'){
+    body={
+      trading_mode:document.getElementById('setMode').value,
+      trading_pairs:document.getElementById('setPairs').value.split(','),
+      leverage:parseInt(document.getElementById('setLeverage').value)||undefined,
+      margin_type:document.getElementById('setMarginType').value,
+      min_consensus_score:parseFloat(document.getElementById('setConsensus').value)||undefined,
+      min_agents_agree:parseInt(document.getElementById('setAgents').value)||undefined,
+      max_portfolio_risk_pct:parseFloat(document.getElementById('setRisk').value)||undefined,
+      trade_margin_cap_usdt:parseFloat(document.getElementById('setCap').value)||undefined,
+    };
+  } else {
+    body={
+      trading_mode:document.getElementById('setMode').value,
+      trading_pairs:document.getElementById('setPairs').value.split(','),
+      min_consensus_score:parseFloat(document.getElementById('setConsensus').value)||undefined,
+      min_agents_agree:parseInt(document.getElementById('setAgents').value)||undefined,
+      max_portfolio_risk_pct:parseFloat(document.getElementById('setRisk').value)||undefined,
+      trade_usdt_cap:parseFloat(document.getElementById('setCap').value)||undefined,
+    };
+  }
+  await fetch(`${apiBase()}/settings`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   alert('Settings saved! Engine will use new settings on next scan.');
 }
 

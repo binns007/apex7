@@ -9,12 +9,20 @@ outright whenever regime == VOLATILE. Crypto routinely exceeds naive
 volatility thresholds intraday, so that combination could blackout
 trading for long stretches even in tradeable conditions.
 
-New design: this agent still classifies regime and still votes HOLD
+v2 design: this agent still classifies regime and still votes HOLD
 when volatile (that's a legitimate vote), but the hard block has moved
 out of here entirely. consensus_engine now applies a *soft* multiplier
-(config: REGIME_VOLATILE_SCORE_MULTIPLIER) by default, with an opt-in
-switch (REGIME_HARD_BLOCK_VOLATILE) to restore the old behavior.
-Thresholds are now config-driven instead of hardcoded magic numbers.
+by default, with an opt-in switch to restore the old behavior.
+Thresholds are config-driven instead of hardcoded magic numbers.
+
+v3 (Futures Mode support): the timeframe this agent runs on, and its
+trend/volatility thresholds, are now constructor parameters instead of
+hardcoded/class-level. Spot uses 15m with the original thresholds;
+Futures Mode constructs a SEPARATE RegimeAgent instance on 5m with
+tighter thresholds — each engine's regime state now lives on its own
+instance (previously a class-level dict shared by ALL instances, which
+would have let a spot BTCUSDT regime read collide with a futures
+BTCUSDT regime read had both engines run at once).
 """
 import math
 import numpy as np
@@ -30,7 +38,12 @@ REGIME_VOLATILE = "VOLATILE"
 REGIME_UNKNOWN = "UNKNOWN"
 
 
-def classify_regime(df: pd.DataFrame) -> tuple[str, float]:
+def classify_regime(
+    df: pd.DataFrame,
+    trend_adx: float,
+    volatile_atr_pct: float,
+    volatile_bb_width: float,
+) -> tuple[str, float]:
     """Return (regime, confidence) based on the last N candles."""
     if len(df) < 50:
         return REGIME_RANGING, 0.5
@@ -47,16 +60,14 @@ def classify_regime(df: pd.DataFrame) -> tuple[str, float]:
     ema50 = last["ema_50"]
     ema200 = last["ema_200"]
 
-    trend_adx = settings.REGIME_TREND_ADX
-
     if adx > trend_adx and close > ema50 > ema200:
         return REGIME_TREND_UP, min(adx / 50, 1.0)
     if adx > trend_adx and close < ema50 < ema200:
         return REGIME_TREND_DOWN, min(adx / 50, 1.0)
 
     atr_pct = atr / close * 100 if close else 0.0
-    if atr_pct > settings.REGIME_VOLATILE_ATR_PCT or bb_w > settings.REGIME_VOLATILE_BB_WIDTH:
-        return REGIME_VOLATILE, min(atr_pct / (settings.REGIME_VOLATILE_ATR_PCT * 2), 1.0)
+    if atr_pct > volatile_atr_pct or bb_w > volatile_bb_width:
+        return REGIME_VOLATILE, min(atr_pct / (volatile_atr_pct * 2), 1.0)
 
     return REGIME_RANGING, 0.6
 
@@ -65,15 +76,36 @@ class RegimeAgent(BaseAgent):
     name = "Regime"
     weight = 1.2
 
-    # Per-symbol last-known regime, read by the consensus engine's soft gate.
-    _last_regime: dict[str, str] = {}
-    _last_regime_confidence: dict[str, float] = {}
+    def __init__(
+        self,
+        timeframe: str = "15m",
+        trend_adx: float = None,
+        volatile_atr_pct: float = None,
+        volatile_bb_width: float = None,
+    ):
+        # Which timeframe this instance classifies regime on. Spot uses
+        # 15m (the slowest of its 3 timeframes); Futures Mode passes 5m
+        # (the slowest of its faster 1m/3m/5m stack) so "trend" still
+        # means the highest timeframe available in that engine.
+        self.timeframe = timeframe
+        self.trend_adx = settings.REGIME_TREND_ADX if trend_adx is None else trend_adx
+        self.volatile_atr_pct = settings.REGIME_VOLATILE_ATR_PCT if volatile_atr_pct is None else volatile_atr_pct
+        self.volatile_bb_width = settings.REGIME_VOLATILE_BB_WIDTH if volatile_bb_width is None else volatile_bb_width
+
+        # Per-symbol last-known regime, read by this engine's consensus
+        # soft gate. Instance-level (not class-level) so a spot engine
+        # and a futures engine each keep independent regime state even
+        # when trading the same symbol at the same time.
+        self._last_regime: dict[str, str] = {}
+        self._last_regime_confidence: dict[str, float] = {}
 
     async def analyze(self, symbol, timeframe, df, extras) -> AgentSignal:
-        if timeframe != "15m":
-            return self.hold(symbol, timeframe, "Regime runs on 15m only")
+        if timeframe != self.timeframe:
+            return self.hold(symbol, timeframe, f"Regime runs on {self.timeframe} only")
 
-        regime, confidence = classify_regime(df)
+        regime, confidence = classify_regime(
+            df, self.trend_adx, self.volatile_atr_pct, self.volatile_bb_width
+        )
         self._last_regime[symbol] = regime
         self._last_regime_confidence[symbol] = confidence
 
@@ -105,10 +137,8 @@ class RegimeAgent(BaseAgent):
 
         return self.hold(symbol, timeframe, f"Regime=RANGING ADX={adx:.1f}")
 
-    @classmethod
-    def get_regime(cls, symbol: str) -> str:
-        return cls._last_regime.get(symbol, REGIME_UNKNOWN)
+    def get_regime(self, symbol: str) -> str:
+        return self._last_regime.get(symbol, REGIME_UNKNOWN)
 
-    @classmethod
-    def get_regime_confidence(cls, symbol: str) -> float:
-        return cls._last_regime_confidence.get(symbol, 0.0)
+    def get_regime_confidence(self, symbol: str) -> float:
+        return self._last_regime_confidence.get(symbol, 0.0)

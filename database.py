@@ -12,6 +12,16 @@ Changes vs v2:
     the dashboard/API had no way to show per-trade risk. Existing rows
     will show NULL for this column (SQLite doesn't backfill history) —
     only trades opened after this change populate it.
+
+Changes vs v3 (Futures Mode):
+  - Added FuturesTrade / FuturesAgentSignal / FuturesPerformanceSnapshot
+    as SEPARATE tables rather than bolting leverage/margin/liquidation
+    columns onto the spot Trade table. Futures positions carry enough
+    extra state (leverage, margin, liquidation price, ROI-on-margin %
+    instead of raw price-%) that mixing them into one heavily-nullable
+    table would make every spot query filter noise. Same column
+    conventions and index strategy as the spot tables, so the two are
+    easy to reason about side by side.
 """
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -39,7 +49,7 @@ class Trade(Base):
     exit_price: Mapped[float] = mapped_column(Float, nullable=True)
     quantity: Mapped[float] = mapped_column(Float)
     usdt_value: Mapped[float] = mapped_column(Float)
-    risk_usdt: Mapped[float] = mapped_column(Float, nullable=True)  # NEW — $ risked per trade
+    risk_usdt: Mapped[float] = mapped_column(Float, nullable=True)  # $ risked per trade
     stop_loss: Mapped[float] = mapped_column(Float, nullable=True)
     take_profit: Mapped[float] = mapped_column(Float, nullable=True)
     pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)
@@ -93,8 +103,80 @@ class PerformanceSnapshot(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+# ══════════════════════════════════════════════════
+#  FUTURES MODE — separate tables, same conventions
+# ══════════════════════════════════════════════════
+
+class FuturesTrade(Base):
+    __tablename__ = "futures_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20))
+    side: Mapped[str] = mapped_column(String(10))
+    leverage: Mapped[int] = mapped_column(Integer, default=1)
+    margin_type: Mapped[str] = mapped_column(String(10), default="ISOLATED")
+    entry_price: Mapped[float] = mapped_column(Float)
+    exit_price: Mapped[float] = mapped_column(Float, nullable=True)
+    quantity: Mapped[float] = mapped_column(Float)
+    usdt_value: Mapped[float] = mapped_column(Float)          # notional value
+    margin_usdt: Mapped[float] = mapped_column(Float, nullable=True)   # actual capital committed
+    risk_usdt: Mapped[float] = mapped_column(Float, nullable=True)     # $ risked at stop-loss
+    stop_loss: Mapped[float] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float] = mapped_column(Float, nullable=True)
+    liquidation_price: Mapped[float] = mapped_column(Float, nullable=True)  # estimate at entry
+    pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)
+    pnl_pct: Mapped[float] = mapped_column(Float, nullable=True)  # ROI on MARGIN (leverage-adjusted)
+    status: Mapped[str] = mapped_column(String(20), default="OPEN")   # OPEN | CLOSED | LIQUIDATED
+    consensus_score: Mapped[float] = mapped_column(Float, nullable=True)
+    agents_agree: Mapped[int] = mapped_column(Integer, nullable=True)
+    regime: Mapped[str] = mapped_column(String(20), nullable=True)
+    is_testnet: Mapped[bool] = mapped_column(Boolean, default=True)
+    binance_order_id: Mapped[str] = mapped_column(String(50), nullable=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    closed_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    notes: Mapped[str] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_futures_trades_status", "status"),
+        Index("ix_futures_trades_symbol", "symbol"),
+        Index("ix_futures_trades_opened_at", "opened_at"),
+    )
+
+
+class FuturesAgentSignal(Base):
+    __tablename__ = "futures_agent_signals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(20))
+    timeframe: Mapped[str] = mapped_column(String(5))
+    agent_name: Mapped[str] = mapped_column(String(50))
+    signal: Mapped[str] = mapped_column(String(10))
+    confidence: Mapped[float] = mapped_column(Float)
+    reason: Mapped[str] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index("ix_futures_signals_symbol", "symbol"),
+        Index("ix_futures_signals_created_at", "created_at"),
+        Index("ix_futures_signals_agent_name", "agent_name"),
+    )
+
+
+class FuturesPerformanceSnapshot(Base):
+    __tablename__ = "futures_performance_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    total_trades: Mapped[int] = mapped_column(Integer, default=0)
+    winning_trades: Mapped[int] = mapped_column(Integer, default=0)
+    total_pnl_usdt: Mapped[float] = mapped_column(Float, default=0.0)
+    win_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    max_drawdown: Mapped[float] = mapped_column(Float, default=0.0)
+    portfolio_value: Mapped[float] = mapped_column(Float, default=0.0)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 async def init_db():
-    """Create all tables."""
+    """Create all tables (spot + futures)."""
     import os
     os.makedirs("data", exist_ok=True)
     async with engine.begin() as conn:

@@ -20,6 +20,19 @@ Changes vs v2:
     open positions) and `combined_pnl_usdt` (realized + unrealized),
     instead of only ever reporting closed-trade PnL. The dashboard
     stat card was silently ignoring anything still open.
+
+Changes vs v3 (Futures Mode):
+  - Full parallel route set under /api/futures/* — status, engine
+    start (accepts leverage + margin_type)/stop/resume, trades,
+    performance, signals, market data, and settings. Same shapes as
+    the spot routes plus leverage/margin/liquidation fields.
+  - The WebSocket broadcaster now pushes BOTH engines' status/prices
+    in one message (`status`/`prices` = spot, `futures_status`/
+    `futures_prices` = futures) so the dashboard can run a single
+    connection and just switch which half of the payload it reads
+    when the person toggles Spot/Futures.
+  - lifespan() now also shuts down futures_market_data's HTTP session
+    and stops the futures engine on app shutdown.
 """
 import asyncio
 import logging
@@ -33,9 +46,14 @@ from pydantic import BaseModel
 from sqlalchemy import select, desc
 
 from config import settings
-from database import init_db, AsyncSessionLocal, Trade, AgentSignal, PerformanceSnapshot
+from database import (
+    init_db, AsyncSessionLocal, Trade, AgentSignal, PerformanceSnapshot,
+    FuturesTrade, FuturesAgentSignal, FuturesPerformanceSnapshot,
+)
 from market_data import fetch_price, fetch_all_prices, fetch_candles, shutdown as market_data_shutdown
+import futures_market_data as fmd
 from trading_engine import engine
+from futures_trading_engine import futures_engine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,7 +92,7 @@ ws_manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    logger.info("✅ Database initialized")
+    logger.info("✅ Database initialized (spot + futures tables)")
     problems = settings.validate()
     if problems:
         for p in problems:
@@ -82,26 +100,38 @@ async def lifespan(app: FastAPI):
     broadcaster_task = asyncio.create_task(_ws_broadcaster())
     yield
     engine.stop()
+    futures_engine.stop()
     broadcaster_task.cancel()
     await market_data_shutdown()
+    await fmd.shutdown()
 
 
-app = FastAPI(title="APEX-7 Trading Bot", version="2.1.0", lifespan=lifespan)
+app = FastAPI(title="APEX-7 Trading Bot", version="3.0.0", lifespan=lifespan)
 
 
 async def _ws_broadcaster():
     while True:
         try:
-            status = engine.get_status()
-            prices = {}
+            spot_status = engine.get_status()
+            futures_status = futures_engine.get_status()
+
+            spot_prices = {}
+            futures_prices = {}
             try:
-                prices = await fetch_all_prices(settings.TRADING_PAIRS)
+                spot_prices = await fetch_all_prices(settings.TRADING_PAIRS)
             except Exception:
                 pass
+            try:
+                futures_prices = await fmd.fetch_all_prices(settings.FUTURES_TRADING_PAIRS)
+            except Exception:
+                pass
+
             await ws_manager.broadcast({
                 "type": "tick",
-                "status": status,
-                "prices": prices,
+                "status": spot_status,
+                "prices": spot_prices,
+                "futures_status": futures_status,
+                "futures_prices": futures_prices,
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
         except Exception as e:
@@ -113,8 +143,8 @@ async def _ws_broadcaster():
 #  Helpers
 # ─────────────────────────────────────────
 def _unrealized_pnl(trade: Trade, price: Optional[float]) -> tuple[Optional[float], Optional[float]]:
-    """Return (unrealized_pnl_usdt, unrealized_pnl_pct) for an OPEN trade
-    given a live price, or (None, None) if price isn't available."""
+    """Return (unrealized_pnl_usdt, unrealized_pnl_pct) for an OPEN spot
+    trade given a live price, or (None, None) if price isn't available."""
     if not price or price <= 0 or not trade.entry_price:
         return None, None
     pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
@@ -124,9 +154,24 @@ def _unrealized_pnl(trade: Trade, price: Optional[float]) -> tuple[Optional[floa
     return pnl_usdt, pnl_pct
 
 
-# ─────────────────────────────────────────
-#  API Routes
-# ─────────────────────────────────────────
+def _futures_unrealized_pnl(trade: FuturesTrade, price: Optional[float]) -> tuple[Optional[float], Optional[float]]:
+    """Return (unrealized_pnl_usdt, unrealized_pnl_pct) for an OPEN
+    futures trade. pnl_pct here is ROI-on-MARGIN (leverage-adjusted),
+    matching how Binance itself displays futures PnL% — NOT the raw
+    price move %, which is what the spot version returns."""
+    if not price or price <= 0 or not trade.entry_price:
+        return None, None
+    pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
+    if trade.side == "SELL":
+        pnl_pct = -pnl_pct
+    leveraged_pct = pnl_pct * (trade.leverage or 1)
+    pnl_usdt = (trade.margin_usdt or 0.0) * leveraged_pct / 100
+    return pnl_usdt, leveraged_pct
+
+
+# ═══════════════════════════════════════════════════
+#  SPOT API Routes (unchanged)
+# ═══════════════════════════════════════════════════
 @app.get("/api/status")
 async def api_status():
     status = engine.get_status()
@@ -161,8 +206,6 @@ async def api_trades(limit: int = 50, status: Optional[str] = None):
         result = await session.execute(q)
         trades = result.scalars().all()
 
-    # Live prices for any OPEN trades in this page, so we can show
-    # unrealized PnL per-row instead of leaving it blank until close.
     open_symbols = list({t.symbol for t in trades if t.status == "OPEN"})
     live_prices: dict[str, float] = {}
     if open_symbols:
@@ -217,7 +260,6 @@ async def api_performance():
         )
         open_trades = open_result.scalars().all()
 
-    # ── Unrealized PnL across all currently open positions ──
     unrealized_pnl_usdt = 0.0
     if open_trades:
         try:
@@ -302,7 +344,7 @@ async def api_market(symbol: str, interval: str = "5m"):
         last = df.iloc[-1]
 
         def safe(val):
-            return None if val != val else round(float(val), 6)  # NaN != NaN
+            return None if val != val else round(float(val), 6)
 
         return {
             "symbol": symbol,
@@ -345,6 +387,7 @@ async def api_update_settings(body: SettingsUpdate):
     if body.trading_mode in ("live", "testnet"):
         settings.TRADING_MODE = body.trading_mode
         engine.executor.reconnect()
+        futures_engine.executor.reconnect()  # shared TRADING_MODE — resync futures client too
     if body.trading_pairs:
         settings.TRADING_PAIRS = [p.strip().upper() for p in body.trading_pairs if p.strip()]
     if body.min_consensus_score is not None:
@@ -364,6 +407,266 @@ async def api_update_settings(body: SettingsUpdate):
     return {"ok": True, "mode": settings.TRADING_MODE, "config_warnings": warnings}
 
 
+# ═══════════════════════════════════════════════════
+#  FUTURES API Routes
+# ═══════════════════════════════════════════════════
+@app.get("/api/futures/status")
+async def api_futures_status():
+    status = futures_engine.get_status()
+    status["config_warnings"] = settings.validate()
+    return status
+
+
+class FuturesStartBody(BaseModel):
+    leverage: Optional[int] = None
+    margin_type: Optional[str] = None
+
+
+@app.post("/api/futures/engine/start")
+async def api_futures_start(body: FuturesStartBody):
+    leverage = body.leverage if body.leverage is not None else settings.FUTURES_DEFAULT_LEVERAGE
+    leverage = max(1, min(int(leverage), settings.FUTURES_MAX_LEVERAGE_ALLOWED))
+    futures_engine.start(leverage=leverage, margin_type=body.margin_type)
+    return {"ok": True, "message": f"Futures engine started @ {leverage}x", "leverage": leverage}
+
+
+@app.post("/api/futures/engine/stop")
+async def api_futures_stop():
+    futures_engine.stop()
+    return {"ok": True, "message": "Futures engine stopped"}
+
+
+@app.post("/api/futures/engine/resume")
+async def api_futures_resume():
+    futures_engine.risk.resume_trading()
+    return {"ok": True, "message": "Futures trading resumed"}
+
+
+@app.get("/api/futures/trades")
+async def api_futures_trades(limit: int = 50, status: Optional[str] = None):
+    async with AsyncSessionLocal() as session:
+        q = select(FuturesTrade).order_by(desc(FuturesTrade.opened_at)).limit(limit)
+        if status:
+            q = q.where(FuturesTrade.status == status.upper())
+        result = await session.execute(q)
+        trades = result.scalars().all()
+
+    open_symbols = list({t.symbol for t in trades if t.status == "OPEN"})
+    live_prices: dict[str, float] = {}
+    if open_symbols:
+        try:
+            live_prices = await fmd.fetch_all_prices(open_symbols)
+        except Exception:
+            live_prices = {}
+
+    out = []
+    for t in trades:
+        unrealized_usdt, unrealized_pct = (None, None)
+        if t.status == "OPEN":
+            unrealized_usdt, unrealized_pct = _futures_unrealized_pnl(t, live_prices.get(t.symbol))
+
+        out.append({
+            "id": t.id,
+            "symbol": t.symbol,
+            "side": t.side,
+            "leverage": t.leverage,
+            "margin_type": t.margin_type,
+            "entry_price": t.entry_price,
+            "exit_price": t.exit_price,
+            "quantity": t.quantity,
+            "usdt_value": t.usdt_value,           # notional
+            "margin_usdt": t.margin_usdt,
+            "risk_usdt": t.risk_usdt,
+            "stop_loss": t.stop_loss,
+            "take_profit": t.take_profit,
+            "liquidation_price": t.liquidation_price,
+            "pnl_usdt": t.pnl_usdt,
+            "pnl_pct": t.pnl_pct,                  # ROI on margin at close
+            "unrealized_pnl_usdt": round(unrealized_usdt, 4) if unrealized_usdt is not None else None,
+            "unrealized_pnl_pct": round(unrealized_pct, 4) if unrealized_pct is not None else None,
+            "status": t.status,
+            "consensus_score": t.consensus_score,
+            "agents_agree": t.agents_agree,
+            "regime": t.regime,
+            "is_testnet": t.is_testnet,
+            "notes": t.notes,
+            "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+            "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+        })
+    return out
+
+
+@app.get("/api/futures/performance")
+async def api_futures_performance():
+    async with AsyncSessionLocal() as session:
+        closed_result = await session.execute(
+            select(FuturesTrade).where(FuturesTrade.status.in_(["CLOSED", "LIQUIDATED"]))
+        )
+        closed = closed_result.scalars().all()
+
+        open_result = await session.execute(
+            select(FuturesTrade).where(FuturesTrade.status == "OPEN")
+        )
+        open_trades = open_result.scalars().all()
+
+    unrealized_pnl_usdt = 0.0
+    if open_trades:
+        try:
+            live_prices = await fmd.fetch_all_prices(list({t.symbol for t in open_trades}))
+        except Exception:
+            live_prices = {}
+        for t in open_trades:
+            pnl_usdt, _ = _futures_unrealized_pnl(t, live_prices.get(t.symbol))
+            if pnl_usdt is not None:
+                unrealized_pnl_usdt += pnl_usdt
+
+    if not closed:
+        base = {
+            "total_trades": 0, "winning_trades": 0, "losing_trades": 0, "liquidations": 0,
+            "win_rate_pct": 0, "total_pnl_usdt": 0,
+            "avg_win_usdt": 0, "avg_loss_usdt": 0,
+            "profit_factor": 0, "best_trade_pct": 0, "worst_trade_pct": 0,
+            "avg_hold_minutes": 0,
+        }
+    else:
+        wins = [t for t in closed if (t.pnl_usdt or 0) > 0]
+        losses = [t for t in closed if (t.pnl_usdt or 0) <= 0]
+        liquidations = [t for t in closed if t.status == "LIQUIDATED"]
+        total_pnl = sum(t.pnl_usdt or 0 for t in closed)
+        gross_profit = sum(t.pnl_usdt for t in wins) if wins else 0
+        gross_loss = abs(sum(t.pnl_usdt for t in losses)) if losses else 1
+
+        hold_minutes = []
+        for t in closed:
+            if t.opened_at and t.closed_at:
+                diff = (t.closed_at - t.opened_at).total_seconds() / 60
+                hold_minutes.append(diff)
+
+        base = {
+            "total_trades": len(closed),
+            "winning_trades": len(wins),
+            "losing_trades": len(losses),
+            "liquidations": len(liquidations),
+            "win_rate_pct": round(len(wins) / len(closed) * 100, 2),
+            "total_pnl_usdt": round(total_pnl, 4),
+            "avg_win_usdt": round(gross_profit / len(wins), 4) if wins else 0,
+            "avg_loss_usdt": round(-gross_loss / len(losses), 4) if losses else 0,
+            "profit_factor": round(gross_profit / gross_loss, 3),
+            "best_trade_pct": round(max((t.pnl_pct or 0) for t in closed), 3),
+            "worst_trade_pct": round(min((t.pnl_pct or 0) for t in closed), 3),
+            "avg_hold_minutes": round(sum(hold_minutes) / len(hold_minutes), 1) if hold_minutes else 0,
+        }
+
+    base["open_trades_count"] = len(open_trades)
+    base["unrealized_pnl_usdt"] = round(unrealized_pnl_usdt, 4)
+    base["combined_pnl_usdt"] = round(base["total_pnl_usdt"] + unrealized_pnl_usdt, 4)
+    return base
+
+
+@app.get("/api/futures/signals")
+async def api_futures_signals(limit: int = 100, symbol: Optional[str] = None):
+    async with AsyncSessionLocal() as session:
+        q = select(FuturesAgentSignal).order_by(desc(FuturesAgentSignal.created_at)).limit(limit)
+        if symbol:
+            q = q.where(FuturesAgentSignal.symbol == symbol)
+        result = await session.execute(q)
+        signals = result.scalars().all()
+    return [
+        {
+            "id": s.id,
+            "symbol": s.symbol,
+            "timeframe": s.timeframe,
+            "agent_name": s.agent_name,
+            "signal": s.signal,
+            "confidence": s.confidence,
+            "reason": s.reason,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        }
+        for s in signals
+    ]
+
+
+@app.get("/api/futures/market/{symbol}")
+async def api_futures_market(symbol: str, interval: str = "3m"):
+    symbol = symbol.upper()
+    try:
+        df = await fmd.fetch_candles(symbol, interval, 60)
+        price = float(df["close"].iloc[-1])
+        last = df.iloc[-1]
+
+        def safe(val):
+            return None if val != val else round(float(val), 6)
+
+        return {
+            "symbol": symbol,
+            "price": price,
+            "rsi": safe(last["rsi"]),
+            "macd_hist": safe(last["macd_hist"]),
+            "bb_pct": safe(last["bb_pct"]),
+            "vol_zscore": safe(last["vol_zscore"]),
+            "adx": safe(last["adx"]),
+            "atr": safe(last["atr"]),
+            "candles": [
+                {
+                    "t": int(row["open_time"].timestamp() * 1000),
+                    "o": float(row["open"]),
+                    "h": float(row["high"]),
+                    "l": float(row["low"]),
+                    "c": float(row["close"]),
+                    "v": float(row["volume"]),
+                }
+                for _, row in df.tail(60).iterrows()
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class FuturesSettingsUpdate(BaseModel):
+    trading_mode: Optional[str] = None
+    trading_pairs: Optional[list[str]] = None
+    leverage: Optional[int] = None
+    margin_type: Optional[str] = None
+    min_consensus_score: Optional[float] = None
+    min_agents_agree: Optional[int] = None
+    max_portfolio_risk_pct: Optional[float] = None
+    trade_margin_cap_usdt: Optional[float] = None
+
+
+@app.post("/api/futures/settings")
+async def api_update_futures_settings(body: FuturesSettingsUpdate):
+    if body.trading_mode in ("live", "testnet"):
+        settings.TRADING_MODE = body.trading_mode
+        futures_engine.executor.reconnect()
+        engine.executor.reconnect()  # shared TRADING_MODE — resync spot client too
+    if body.trading_pairs:
+        settings.FUTURES_TRADING_PAIRS = [p.strip().upper() for p in body.trading_pairs if p.strip()]
+    if body.leverage is not None:
+        futures_engine.update_leverage(body.leverage)
+        settings.FUTURES_DEFAULT_LEVERAGE = futures_engine.leverage
+    if body.margin_type is not None:
+        futures_engine.update_margin_type(body.margin_type)
+        settings.FUTURES_MARGIN_TYPE = futures_engine.margin_type
+    if body.min_consensus_score is not None:
+        settings.FUTURES_MIN_CONSENSUS_SCORE = body.min_consensus_score
+    if body.min_agents_agree is not None:
+        settings.FUTURES_MIN_AGENTS_AGREE = body.min_agents_agree
+    if body.max_portfolio_risk_pct is not None:
+        settings.FUTURES_MAX_PORTFOLIO_RISK_PCT = body.max_portfolio_risk_pct
+    if body.trade_margin_cap_usdt is not None:
+        settings.FUTURES_TRADE_MARGIN_CAP_USDT = body.trade_margin_cap_usdt
+
+    warnings = settings.validate()
+    return {
+        "ok": True, "mode": settings.TRADING_MODE,
+        "leverage": futures_engine.leverage, "margin_type": futures_engine.margin_type,
+        "config_warnings": warnings,
+    }
+
+
+# ═══════════════════════════════════════════════════
+#  WebSocket + Dashboard
+# ═══════════════════════════════════════════════════
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
