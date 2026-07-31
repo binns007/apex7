@@ -19,6 +19,15 @@ Changes vs v2:
   - `pos.risk_usdt` (already computed by RiskManager.size_position) is
     now actually persisted on the Trade row via _save_trade(), so the
     dashboard can show $ at risk per trade instead of just usdt_value.
+
+Changes vs v3 (Signal Lab):
+  - Every directional candidate the consensus engine produces — whether
+    or not it clears MIN_CONSENSUS_SCORE / MIN_AGENTS_AGREE and becomes
+    a real order — is now recorded via signal_lab.record_candidate() and
+    tracked forward via signal_lab.resolve_pending(), so "what if we'd
+    taken this?" data accumulates for every candidate, not just the ones
+    that fired. Real trades are still linked back to their shadow row
+    (signal_lab.link_trade()) so the two can be cross-referenced.
 """
 import asyncio
 import logging
@@ -32,8 +41,10 @@ from config import settings
 from consensus_engine import PolyphonicConsensusEngine
 from risk_manager import RiskManager
 from order_executor import OrderExecutor
+import market_data
 from market_data import fetch_all_prices, fetch_price
 from database import AsyncSessionLocal, Trade, AgentSignal as DBSignal, PerformanceSnapshot
+import signal_lab
 from agents import (
     MomentumAgent, MeanReversionAgent, BreakoutAgent,
     VolumeAgent, SentimentAgent, OrderBookAgent,
@@ -91,6 +102,25 @@ class TradingEngine:
     def is_running(self) -> bool:
         return self._running
 
+    def apply_agent_weights(self, weights: dict) -> dict:
+        """Signal Lab hook: mutate LIVE agent instance `.weight` values
+        based on measured hypothetical accuracy. Takes effect on the
+        very next scan cycle — no restart needed. Returns the weights
+        actually applied (unrecognized agent names are ignored)."""
+        applied = {}
+        for agent in self.consensus.agents:
+            if agent.name in weights:
+                try:
+                    new_w = float(weights[agent.name])
+                except (TypeError, ValueError):
+                    continue
+                agent.weight = new_w
+                applied[agent.name] = new_w
+        if applied:
+            logger.info(f"⚙ Signal Lab applied agent weights: {applied}")
+            self._log(f"⚙ Signal Lab applied agent weights: {applied}")
+        return applied
+
     # ─────────────────────────────────────────
     #  Main loop
     # ─────────────────────────────────────────
@@ -116,6 +146,16 @@ class TradingEngine:
 
         await self._check_open_positions(portfolio_usdt)
 
+        # Signal Lab: resolve shadow "what if" candidates against live
+        # prices every cycle, independent of halt state — this is pure
+        # observation and should keep running even while real trading
+        # is paused, so the data doesn't have a gap right when it's
+        # most interesting (post-drawdown, post-halt).
+        try:
+            await signal_lab.resolve_pending("SPOT", market_data, settings.SIGNAL_LAB_MAX_HOLD_MINUTES)
+        except Exception as e:
+            logger.debug(f"Signal Lab resolve failed: {e}")
+
         if self.risk.halted:
             self._log(f"🛑 Trading halted: {self.risk.halt_reason}")
             return
@@ -136,14 +176,29 @@ class TradingEngine:
         result = await self.consensus.evaluate(symbol)
         await self._save_signals(result.signals)
 
+        # ── Fetch price once, reused for both Signal Lab recording (any
+        #    directional candidate) and real trade execution (only when
+        #    action != HOLD). ──
+        price = None
+        if result.candidate_direction or result.action != "HOLD":
+            try:
+                price = await fetch_price(symbol)
+            except Exception as e:
+                logger.error(f"Price fetch failed {symbol}: {e}")
+                price = None
+
+        shadow_id = None
+        if result.candidate_direction and price and not (isinstance(price, float) and math.isnan(price)) and price > 0:
+            try:
+                shadow_id = await signal_lab.record_candidate(
+                    market_type="SPOT", symbol=symbol, price=price,
+                    result=result, was_taken=(result.action != "HOLD"),
+                )
+            except Exception as e:
+                logger.debug(f"Signal Lab record failed {symbol}: {e}")
+
         if result.action == "HOLD":
             logger.debug(f"{symbol}: HOLD — {result.primary_reason}")
-            return
-
-        try:
-            price = await fetch_price(symbol)
-        except Exception as e:
-            logger.error(f"Price fetch failed {symbol}: {e}")
             return
 
         if price is None or (isinstance(price, float) and math.isnan(price)) or price <= 0:
@@ -186,7 +241,7 @@ class TradingEngine:
 
         self.risk.on_trade_open(symbol, pos.risk_usdt)
 
-        await self._save_trade(
+        trade_id = await self._save_trade(
             symbol=symbol,
             side=result.action,
             entry_price=price,
@@ -201,6 +256,12 @@ class TradingEngine:
             binance_order_id=str(order.get("orderId", "")),
             notes=(result.primary_reason + exit_note) if exit_note else result.primary_reason,
         )
+
+        if shadow_id and trade_id:
+            try:
+                await signal_lab.link_trade(shadow_id, trade_id)
+            except Exception as e:
+                logger.debug(f"Signal Lab link failed {symbol}: {e}")
 
         msg = (f"✅ {result.action} {symbol} @ {price:.4f} "
                f"qty={pos.quantity:.6f} TP={pos.take_profit_price:.4f} "
@@ -253,7 +314,7 @@ class TradingEngine:
     # ─────────────────────────────────────────
     #  DB helpers
     # ─────────────────────────────────────────
-    async def _save_trade(self, **kwargs):
+    async def _save_trade(self, **kwargs) -> Optional[int]:
         async with AsyncSessionLocal() as session:
             trade = Trade(
                 is_testnet=settings.is_testnet,
@@ -263,6 +324,8 @@ class TradingEngine:
             )
             session.add(trade)
             await session.commit()
+            await session.refresh(trade)
+            return trade.id
 
     async def _close_trade(self, trade: Trade, exit_price: float,
                             pnl_usdt: float, pnl_pct: float):

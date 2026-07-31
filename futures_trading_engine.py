@@ -23,6 +23,15 @@ spot, and tuned for the "quick, small, frequent" leveraged trade style:
 
 Hedge mode (independent long+short books per symbol) is NOT supported —
 one open position per symbol, one-way mode, matching FUTURES_POSITION_MODE.
+
+Changes vs v1 (Signal Lab):
+  - Every directional candidate the (futures-tuned) consensus engine
+    produces — whether or not it clears the futures thresholds and
+    becomes a real leveraged order — is recorded via
+    signal_lab.record_candidate() and tracked forward via
+    signal_lab.resolve_pending(), using its own "FUTURES" market_type
+    partition and its own (shorter) max-hold window, independent of the
+    spot engine's shadow tracking.
 """
 import asyncio
 import logging
@@ -38,6 +47,7 @@ from futures_risk_manager import FuturesRiskManager
 from futures_order_executor import FuturesOrderExecutor
 import futures_market_data as fmd
 from database import AsyncSessionLocal, FuturesTrade, FuturesAgentSignal, FuturesPerformanceSnapshot
+import signal_lab
 from agents import (
     MomentumAgent, MeanReversionAgent, BreakoutAgent,
     VolumeAgent, SentimentAgent, OrderBookAgent,
@@ -155,6 +165,25 @@ class FuturesTradingEngine:
             self.margin_type = margin_type
             self._log(f"Margin type updated to {self.margin_type} (applies to new entries)")
 
+    def apply_agent_weights(self, weights: dict) -> dict:
+        """Signal Lab hook: mutate LIVE agent instance `.weight` values
+        for the FUTURES engine's own agent instances (independent from
+        the spot engine's instances). Takes effect on the very next scan
+        cycle — no restart needed."""
+        applied = {}
+        for agent in self.consensus.agents:
+            if agent.name in weights:
+                try:
+                    new_w = float(weights[agent.name])
+                except (TypeError, ValueError):
+                    continue
+                agent.weight = new_w
+                applied[agent.name] = new_w
+        if applied:
+            logger.info(f"⚙ Signal Lab applied futures agent weights: {applied}")
+            self._log(f"⚙ Signal Lab applied agent weights: {applied}")
+        return applied
+
     # ─────────────────────────────────────────
     #  Main loop
     # ─────────────────────────────────────────
@@ -180,6 +209,16 @@ class FuturesTradingEngine:
 
         await self._check_open_positions()
 
+        # Signal Lab: resolve shadow "what if" candidates against live
+        # prices every cycle, independent of halt state (pure
+        # observation — never places/cancels a real order).
+        try:
+            await signal_lab.resolve_pending(
+                "FUTURES", fmd, settings.FUTURES_SIGNAL_LAB_MAX_HOLD_MINUTES
+            )
+        except Exception as e:
+            logger.debug(f"Signal Lab resolve failed: {e}")
+
         if self.risk.halted:
             self._log(f"🛑 Trading halted: {self.risk.halt_reason}")
             return
@@ -200,14 +239,29 @@ class FuturesTradingEngine:
         result = await self.consensus.evaluate(symbol)
         await self._save_signals(result.signals)
 
+        # ── Fetch price once, reused for both Signal Lab recording (any
+        #    directional candidate) and real trade execution (only when
+        #    action != HOLD). ──
+        price = None
+        if result.candidate_direction or result.action != "HOLD":
+            try:
+                price = await fmd.fetch_price(symbol)
+            except Exception as e:
+                logger.error(f"Futures price fetch failed {symbol}: {e}")
+                price = None
+
+        shadow_id = None
+        if result.candidate_direction and price and not (isinstance(price, float) and math.isnan(price)) and price > 0:
+            try:
+                shadow_id = await signal_lab.record_candidate(
+                    market_type="FUTURES", symbol=symbol, price=price,
+                    result=result, was_taken=(result.action != "HOLD"),
+                )
+            except Exception as e:
+                logger.debug(f"Signal Lab record failed {symbol}: {e}")
+
         if result.action == "HOLD":
             logger.debug(f"{symbol}: HOLD — {result.primary_reason}")
-            return
-
-        try:
-            price = await fmd.fetch_price(symbol)
-        except Exception as e:
-            logger.error(f"Futures price fetch failed {symbol}: {e}")
             return
 
         if price is None or (isinstance(price, float) and math.isnan(price)) or price <= 0:
@@ -257,7 +311,7 @@ class FuturesTradingEngine:
 
         self.risk.on_trade_open(symbol, pos.risk_usdt)
 
-        await self._save_trade(
+        trade_id = await self._save_trade(
             symbol=symbol,
             side=result.action,
             entry_price=price,
@@ -276,6 +330,12 @@ class FuturesTradingEngine:
             binance_order_id=str(order.get("orderId", "")),
             notes=(result.primary_reason + exit_note) if exit_note else result.primary_reason,
         )
+
+        if shadow_id and trade_id:
+            try:
+                await signal_lab.link_trade(shadow_id, trade_id)
+            except Exception as e:
+                logger.debug(f"Signal Lab link failed {symbol}: {e}")
 
         msg = (f"✅ {result.action} {symbol} {pos.leverage}x @ {price:.4f} "
                f"qty={pos.quantity:.6f} margin=${pos.margin_usdt:.2f} "
@@ -338,7 +398,7 @@ class FuturesTradingEngine:
     # ─────────────────────────────────────────
     #  DB helpers
     # ─────────────────────────────────────────
-    async def _save_trade(self, **kwargs):
+    async def _save_trade(self, **kwargs) -> Optional[int]:
         async with AsyncSessionLocal() as session:
             trade = FuturesTrade(
                 is_testnet=settings.is_testnet,
@@ -348,6 +408,8 @@ class FuturesTradingEngine:
             )
             session.add(trade)
             await session.commit()
+            await session.refresh(trade)
+            return trade.id
 
     async def _close_trade(self, trade: FuturesTrade, exit_price: float,
                             pnl_usdt: float, pnl_pct: float, was_liquidation: bool):

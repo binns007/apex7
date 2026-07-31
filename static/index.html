@@ -381,6 +381,12 @@ body.futures-mode .spot-only{display:none}
 }
 .lev-quick-btn:hover,.lev-quick-btn.active{border-color:#ff9500;color:#ff9500}
 
+/* ── SIGNAL LAB PAGE ── */
+.sl-intro{font-size:11px;color:var(--muted);margin-top:4px;max-width:760px;line-height:1.6}
+.sl-panel-btn{padding:6px 16px;font-size:10px;white-space:nowrap}
+.sl-weight-changed{color:var(--accent);font-weight:700}
+.sl-empty-row td{text-align:center;padding:20px;color:var(--muted);font-size:11px}
+
 /* ── RESPONSIVE ── */
 @media(max-width:1100px){
   .content{grid-template-columns:180px 1fr}
@@ -439,6 +445,9 @@ body.futures-mode .spot-only{display:none}
     </div>
     <div class="nav-item" onclick="showPage('agents',this)">
       <span class="nav-icon">⊛</span> Agent Signals
+    </div>
+    <div class="nav-item" onclick="showPage('signallab',this)">
+      <span class="nav-icon">🧪</span> Signal Lab
     </div>
     <div class="nav-item" onclick="showPage('settings',this)">
       <span class="nav-icon">⚙</span> Settings
@@ -600,6 +609,93 @@ body.futures-mode .spot-only{display:none}
             <tr><th>Agent</th><th>Symbol</th><th>TF</th><th>Signal</th><th>Confidence</th><th>Reason</th><th>Time</th></tr>
           </thead>
           <tbody id="signalTable"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── PAGE: Signal Lab ── -->
+  <div class="page" id="page-signallab">
+    <div style="margin-bottom:16px">
+      <h2 style="font-family:var(--font-mono);font-size:14px;letter-spacing:2px;color:var(--muted)">SIGNAL LAB — WHAT-IF ANALYTICS</h2>
+      <div class="sl-intro">
+        Every scan cycle, the consensus engine's directional candidates are recorded and tracked forward
+        against the exact same ATR-based exits it would have used — whether or not the trade actually
+        fired. This is what a "2-of-8, Momentum + OrderBook only" signal would really have done, based on
+        live forward-tested outcomes, not a backtest assumption.
+      </div>
+    </div>
+
+    <div class="stat-row" id="slStatGrid"></div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">RECOMMENDED AGENT WEIGHTS</span>
+        <button class="save-btn sl-panel-btn" onclick="applySignalLabWeights()">APPLY TO LIVE ENGINE</button>
+      </div>
+      <div class="panel-body trade-table-wrap" style="padding:0 8px">
+        <table class="trade-table">
+          <thead>
+            <tr><th>Agent</th><th>Current Weight</th><th>Samples</th><th>Win Rate (Agreed)</th><th>Avg PnL (Agreed)</th><th>Suggested Weight</th></tr>
+          </thead>
+          <tbody id="slWeightTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header"><span class="panel-title">AGENT PERFORMANCE — AGREED VS DISAGREED</span></div>
+      <div class="panel-body trade-table-wrap" style="padding:0 8px">
+        <table class="trade-table">
+          <thead>
+            <tr><th>Agent</th><th>Samples</th><th>Win Rate</th><th>Avg PnL ($100 stake)</th><th>Samples (Disagreed)</th><th>Win Rate (Disagreed)</th></tr>
+          </thead>
+          <tbody id="slAgentTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header"><span class="panel-title">TOP AGENT COMBINATIONS</span></div>
+      <div class="panel-body trade-table-wrap" style="padding:0 8px">
+        <table class="trade-table">
+          <thead>
+            <tr><th>Agreeing Agents</th><th>#</th><th>Samples</th><th>Win Rate</th><th>Avg PnL</th><th>Total PnL</th></tr>
+          </thead>
+          <tbody id="slComboTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header"><span class="panel-title">PERFORMANCE BY AGENTS-AGREE COUNT</span></div>
+      <div class="panel-body trade-table-wrap" style="padding:0 8px">
+        <table class="trade-table">
+          <thead>
+            <tr><th>Agents Agree</th><th>Samples</th><th>Win Rate</th><th>Avg PnL</th></tr>
+          </thead>
+          <tbody id="slBucketTable"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">RECENT SHADOW CANDIDATES</span>
+        <select id="slOutcomeFilter" onchange="loadSignalLabOutcomes()" style="background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:4px 8px;border-radius:4px;font-size:11px;outline:none">
+          <option value="">All</option>
+          <option value="PENDING">Pending</option>
+          <option value="TP">Hit TP</option>
+          <option value="SL">Hit SL</option>
+          <option value="EXPIRED">Expired</option>
+        </select>
+      </div>
+      <div class="panel-body trade-table-wrap" style="padding:0 8px">
+        <table class="trade-table">
+          <thead>
+            <tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>Score</th><th>Agree</th><th>Taken?</th><th>Status</th><th>PnL$</th><th>Time</th></tr>
+          </thead>
+          <tbody id="slOutcomeTable"></tbody>
         </table>
       </div>
     </div>
@@ -787,6 +883,10 @@ function status(){ return currentMarket==='futures' ? futuresStatus : spotStatus
 function prices(){ return currentMarket==='futures' ? futuresPrices : spotPrices; }
 function apiBase(){ return currentMarket==='futures' ? '/api/futures' : '/api'; }
 function engineRunning(){ return !!status().running; }
+// Signal Lab uses ONE shared table (market_type column) rather than a
+// /api/futures/ prefix split — this is the single place that maps the
+// header toggle to the value Signal Lab's API expects.
+function slMarketType(){ return currentMarket==='futures' ? 'FUTURES' : 'SPOT'; }
 
 // ── WebSocket ──────────────────────────
 function connectWS(){
@@ -825,6 +925,7 @@ function setMarket(m){
   loadSettingsForm();
   if(document.getElementById('page-performance').classList.contains('active'))loadPerformance();
   if(document.getElementById('page-agents').classList.contains('active'))loadAgents();
+  if(document.getElementById('page-signallab').classList.contains('active'))loadSignalLab();
 }
 
 // ── Navigation ─────────────────────────
@@ -836,6 +937,7 @@ function showPage(id,el){
   if(id==='trades')loadTrades('');
   if(id==='performance')loadPerformance();
   if(id==='agents')loadAgents();
+  if(id==='signallab')loadSignalLab();
 }
 
 // ── Engine control ─────────────────────
@@ -1271,6 +1373,125 @@ async function loadAgents(){
   }).join('');
 }
 
+// ── Signal Lab ──────────────────────────
+let slRecommendedWeights = {};
+
+async function loadSignalLab(){
+  const mt = slMarketType();
+
+  const [statusData, agentPerf, combos, buckets, recs] = await Promise.all([
+    fetch(`/api/signal-lab/status?market_type=${mt}`).then(r=>r.json()).catch(()=>({})),
+    fetch(`/api/signal-lab/agent-performance?market_type=${mt}`).then(r=>r.json()).catch(()=>[]),
+    fetch(`/api/signal-lab/combo-performance?market_type=${mt}`).then(r=>r.json()).catch(()=>[]),
+    fetch(`/api/signal-lab/agents-agree-performance?market_type=${mt}`).then(r=>r.json()).catch(()=>[]),
+    fetch(`/api/signal-lab/weight-recommendations?market_type=${mt}`).then(r=>r.json()).catch(()=>[]),
+  ]);
+
+  document.getElementById('slStatGrid').innerHTML = `
+    <div class="stat-card">
+      <div class="stat-label">Total Candidates</div>
+      <div class="stat-value accent">${statusData.total_candidates||0}</div>
+      <div class="stat-sub">${statusData.taken_as_real_trades||0} became real trades</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Pending</div>
+      <div class="stat-value yellow">${statusData.pending||0}</div>
+      <div class="stat-sub">still tracking forward</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Resolved</div>
+      <div class="stat-value">${statusData.resolved||0}</div>
+      <div class="stat-sub">${statusData.shadow_only||0} shadow-only (never traded)</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Shadow Win Rate</div>
+      <div class="stat-value ${((statusData.resolved_win_rate_pct||0)>=50)?'green':'red'}">${(statusData.resolved_win_rate_pct||0).toFixed(1)}%</div>
+      <div class="stat-sub">on $${(statusData.notional_stake_usdt||100).toFixed(0)} hypothetical stake</div>
+    </div>
+  `;
+
+  document.getElementById('slAgentTable').innerHTML = agentPerf.length ? agentPerf.map(p=>`
+    <tr>
+      <td style="font-family:var(--font-mono)">${p.agent}</td>
+      <td>${p.samples_when_agreed}</td>
+      <td class="${p.win_rate_when_agreed_pct>=50?'pnl-pos':'pnl-neg'}">${p.win_rate_when_agreed_pct.toFixed(1)}%</td>
+      <td class="${p.avg_pnl_usdt_when_agreed>=0?'pnl-pos':'pnl-neg'}">$${p.avg_pnl_usdt_when_agreed.toFixed(3)}</td>
+      <td>${p.samples_when_disagreed}</td>
+      <td>${p.win_rate_when_disagreed_pct!=null?p.win_rate_when_disagreed_pct.toFixed(1)+'%':'—'}</td>
+    </tr>`).join('') : '<tr class="sl-empty-row"><td colspan="6">Not enough resolved data yet — let the engine run a while</td></tr>';
+
+  document.getElementById('slComboTable').innerHTML = combos.length ? combos.map(c=>`
+    <tr>
+      <td style="font-size:10px">${c.agents.join(', ')}</td>
+      <td>${c.agent_count}</td>
+      <td>${c.samples}</td>
+      <td class="${c.win_rate_pct>=50?'pnl-pos':'pnl-neg'}">${c.win_rate_pct.toFixed(1)}%</td>
+      <td class="${c.avg_pnl_usdt>=0?'pnl-pos':'pnl-neg'}">$${c.avg_pnl_usdt.toFixed(3)}</td>
+      <td class="${c.total_pnl_usdt>=0?'pnl-pos':'pnl-neg'}">$${c.total_pnl_usdt.toFixed(2)}</td>
+    </tr>`).join('') : '<tr class="sl-empty-row"><td colspan="6">Not enough resolved data yet</td></tr>';
+
+  document.getElementById('slBucketTable').innerHTML = buckets.length ? buckets.map(b=>`
+    <tr>
+      <td>${b.agents_agree!=null?b.agents_agree+' / 8':'—'}</td>
+      <td>${b.samples}</td>
+      <td class="${b.win_rate_pct>=50?'pnl-pos':'pnl-neg'}">${b.win_rate_pct.toFixed(1)}%</td>
+      <td class="${b.avg_pnl_usdt>=0?'pnl-pos':'pnl-neg'}">$${b.avg_pnl_usdt.toFixed(3)}</td>
+    </tr>`).join('') : '<tr class="sl-empty-row"><td colspan="4">No resolved data yet</td></tr>';
+
+  slRecommendedWeights = {};
+  document.getElementById('slWeightTable').innerHTML = recs.length ? recs.map(r=>{
+    slRecommendedWeights[r.agent] = r.suggested_weight;
+    const changed = Math.abs(r.suggested_weight - r.current_weight) > 0.01;
+    return `<tr>
+      <td style="font-family:var(--font-mono)">${r.agent}</td>
+      <td>${r.current_weight.toFixed(2)}</td>
+      <td>${r.samples}</td>
+      <td class="${r.win_rate_when_agreed_pct>=50?'pnl-pos':'pnl-neg'}">${r.win_rate_when_agreed_pct.toFixed(1)}%</td>
+      <td class="${r.avg_pnl_usdt_when_agreed>=0?'pnl-pos':'pnl-neg'}">$${r.avg_pnl_usdt_when_agreed.toFixed(3)}</td>
+      <td class="${changed?'sl-weight-changed':''}">${r.suggested_weight.toFixed(2)}</td>
+    </tr>`;
+  }).join('') : '<tr class="sl-empty-row"><td colspan="6">Not enough resolved data yet — keep the engine running</td></tr>';
+
+  loadSignalLabOutcomes();
+}
+
+async function loadSignalLabOutcomes(){
+  const mt = slMarketType();
+  const statusFilter = document.getElementById('slOutcomeFilter')?.value || '';
+  const url = `/api/signal-lab/outcomes?market_type=${mt}&limit=60${statusFilter?'&status='+statusFilter:''}`;
+  const rows = await fetch(url).then(r=>r.json()).catch(()=>[]);
+
+  document.getElementById('slOutcomeTable').innerHTML = rows.length ? rows.map(o=>{
+    const pnlClass = o.pnl_usdt==null ? '' : (o.pnl_usdt>=0?'pnl-pos':'pnl-neg');
+    const statusBadge = o.status==='TP' ? 'badge-buy' : o.status==='SL' ? 'badge-sell' : o.status==='PENDING' ? 'badge-open' : 'badge-closed';
+    return `<tr>
+      <td style="font-family:var(--font-mono);font-size:11px">${o.symbol}</td>
+      <td><span class="badge ${o.direction==='BUY'?'badge-buy':'badge-sell'}">${o.direction}</span></td>
+      <td style="font-family:var(--font-mono);font-size:11px">${o.entry_price.toFixed(4)}</td>
+      <td class="cell-score">${(o.consensus_score*100).toFixed(0)}%</td>
+      <td>${o.agents_agree}/${o.total_agents}</td>
+      <td>${o.was_taken?'✅ real trade':'👻 shadow only'}</td>
+      <td><span class="badge ${statusBadge}">${o.status}</span></td>
+      <td class="${pnlClass}">${o.pnl_usdt!=null?(o.pnl_usdt>=0?'+':'')+'$'+o.pnl_usdt.toFixed(2):'—'}</td>
+      <td style="font-size:10px;color:var(--muted)">${o.created_at?new Date(o.created_at).toLocaleTimeString():'—'}</td>
+    </tr>`;
+  }).join('') : '<tr class="sl-empty-row"><td colspan="9">No candidates recorded yet</td></tr>';
+}
+
+async function applySignalLabWeights(){
+  const mt = slMarketType();
+  if(Object.keys(slRecommendedWeights).length === 0){
+    alert('No recommendations available yet — let more signals resolve first.');
+    return;
+  }
+  await fetch('/api/signal-lab/apply-weights', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({market_type: mt, weights: slRecommendedWeights})
+  });
+  alert(`Applied tuned weights to the live ${mt} engine — takes effect next scan cycle.`);
+  loadSignalLab();
+}
+
 // ── Settings ────────────────────────────
 function loadSettingsForm(){
   const s=status();
@@ -1316,6 +1537,9 @@ async function saveSettings(){
 setInterval(()=>loadChart(),30000);
 setInterval(()=>loadAgents(),15000);
 setInterval(()=>loadTrades(''),20000);
+setInterval(()=>{
+  if(document.getElementById('page-signallab').classList.contains('active'))loadSignalLab();
+},20000);
 
 // ── Util ────────────────────────────────
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}

@@ -38,6 +38,20 @@ Changes vs v2 (Futures Mode support):
      fetch_funding_rate) instead of importing spot's market_data
      functions directly, so the same engine can point at Binance Spot
      or Binance Futures.
+
+Changes vs v3 (Signal Lab support):
+  8. Every ConsensusResult now also carries `candidate_direction` and
+     `candidate_agent_detail` — populated whenever the primary
+     timeframe produced a real BUY/SELL majority, REGARDLESS of
+     whether the score/agents-agree thresholds were actually cleared.
+     stop_loss_pct/take_profit_pct are likewise now computed as soon as
+     a direction exists, not only on the success path. This costs
+     nothing extra on the hot path (same ATR read, same per-agent
+     grouping that scoring already does) but gives signal_lab.py enough
+     to record "what if we'd taken this?" for every candidate the
+     engine ever considers — including the ones that get filtered out
+     by MIN_CONSENSUS_SCORE / MIN_AGENTS_AGREE. Trading behavior itself
+     is completely unchanged; these are pure additions to the result.
 """
 import asyncio
 import logging
@@ -68,6 +82,13 @@ class ConsensusResult:
     primary_reason: str = ""
     stop_loss_pct: float = 0.012
     take_profit_pct: float = 0.024
+    # ── Signal Lab additions — populated whenever the primary timeframe
+    #    produced a real directional majority, even if `action` ends up
+    #    "HOLD" because the trade thresholds weren't met. None/[] when
+    #    there was truly no direction (no primary signal, or an exact
+    #    tie with TIE_BREAK_ACTION="HOLD"). ──
+    candidate_direction: Optional[str] = None
+    candidate_agent_detail: list = field(default_factory=list)
 
 
 class PolyphonicConsensusEngine:
@@ -207,6 +228,15 @@ class PolyphonicConsensusEngine:
         else:
             direction = "BUY" if buy_count > sell_count else "SELL"
 
+        # ── Signal Lab hooks: from here on there IS a real directional
+        #    candidate, whether or not it ends up clearing the threshold
+        #    below. Compute the per-agent agreement breakdown and the
+        #    ATR-based exit levels ONCE, up front, so every return path
+        #    below — including HOLD paths — can attach them for the
+        #    shadow "what if we'd taken this?" tracker (signal_lab.py). ──
+        candidate_agent_detail = self._agent_best_signals(all_signals, direction)
+        candidate_sl_pct, candidate_tp_pct = self._dynamic_rr(candles.get(primary_tf), regime)
+
         # ── Temporal confluence: soft bonus/penalty by default ──
         other_tfs = [tf for tf in self.timeframes if tf != primary_tf]
         confirmed = any(
@@ -217,7 +247,11 @@ class PolyphonicConsensusEngine:
             return ConsensusResult(symbol=symbol, action="HOLD", score=0.0,
                                     agents_agree=0, total_agents=len(all_signals),
                                     regime=regime, signals=all_signals,
-                                    primary_reason=f"No temporal confluence for {direction}")
+                                    primary_reason=f"No temporal confluence for {direction}",
+                                    stop_loss_pct=candidate_sl_pct,
+                                    take_profit_pct=candidate_tp_pct,
+                                    candidate_direction=direction,
+                                    candidate_agent_detail=candidate_agent_detail)
 
         # ── Weighted consensus score ────────
         score, agree_count = self._compute_weighted_score(all_signals, direction)
@@ -229,8 +263,6 @@ class PolyphonicConsensusEngine:
 
         if (score >= self.min_consensus_score and
                 agree_count >= self.min_agents_agree):
-
-            sl_pct, tp_pct = self._dynamic_rr(candles.get(primary_tf), regime)
 
             directional = [s for s in all_signals if s.signal == direction]
             top_reason = max(directional, key=lambda s: s.confidence).reason if directional else ""
@@ -245,8 +277,10 @@ class PolyphonicConsensusEngine:
                 regime=regime,
                 signals=all_signals,
                 primary_reason=top_reason,
-                stop_loss_pct=sl_pct,
-                take_profit_pct=tp_pct,
+                stop_loss_pct=candidate_sl_pct,
+                take_profit_pct=candidate_tp_pct,
+                candidate_direction=direction,
+                candidate_agent_detail=candidate_agent_detail,
             )
 
         return ConsensusResult(
@@ -255,7 +289,11 @@ class PolyphonicConsensusEngine:
             total_agents=len(set(s.agent_name for s in all_signals)),
             regime=regime, signals=all_signals,
             primary_reason=f"Threshold not met: score={score:.3f} agree={agree_count} "
-                            f"(need score>={self.min_consensus_score}, agree>={self.min_agents_agree})"
+                            f"(need score>={self.min_consensus_score}, agree>={self.min_agents_agree})",
+            stop_loss_pct=candidate_sl_pct,
+            take_profit_pct=candidate_tp_pct,
+            candidate_direction=direction,
+            candidate_agent_detail=candidate_agent_detail,
         )
 
     # ─────────────────────────────────────────
@@ -316,6 +354,36 @@ class PolyphonicConsensusEngine:
             return 0.0, agree_count
         score = weighted_agree / weighted_total
         return min(score, 1.0), agree_count
+
+    def _agent_best_signals(self, signals: list[AgentSignal], direction: str) -> list[dict]:
+        """Per-agent breakdown used by the Signal Lab shadow tracker: one
+        entry per agent showing its single best (highest-confidence)
+        signal toward `direction` across whichever timeframes it
+        analyzed that cycle, and whether it actually agreed. Mirrors the
+        same "best-per-agent" selection `_compute_weighted_score` uses
+        for scoring, so the `agreed` flag here is exactly consistent
+        with `agents_agree` — this is what lets analysis regroup
+        resolved outcomes by any agent or combination after the fact."""
+        agent_map: dict[str, list[AgentSignal]] = defaultdict(list)
+        for s in signals:
+            agent_map[s.agent_name].append(s)
+
+        agent_lookup = {a.name: a for a in self.agents}
+        detail = []
+        for agent_name, sigs in agent_map.items():
+            agent = agent_lookup.get(agent_name)
+            weight = agent.weight if agent else 1.0
+            best = max(sigs, key=lambda s: s.confidence if s.signal == direction else -1)
+            agreed = best.signal == direction and best.confidence > 0
+            detail.append({
+                "agent": agent_name,
+                "weight": weight,
+                "timeframe": best.timeframe,
+                "signal": best.signal,
+                "confidence": round(best.confidence, 4),
+                "agreed": agreed,
+            })
+        return detail
 
     def _accuracy_multiplier(self, agent_name: str) -> float:
         history = self._accuracy.get(agent_name, [])

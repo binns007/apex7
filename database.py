@@ -22,11 +22,35 @@ Changes vs v3 (Futures Mode):
     table would make every spot query filter noise. Same column
     conventions and index strategy as the spot tables, so the two are
     easy to reason about side by side.
+
+Changes vs v4 (Signal Lab):
+  - Added SignalOutcome — ONE shared table (not split spot/futures,
+    unlike Trade/FuturesTrade) that records every directional candidate
+    the Polyphonic Consensus Engine produces each scan cycle, whether or
+    not it actually became a real trade. A `market_type` column
+    ("SPOT"/"FUTURES") distinguishes the two instead of a table split,
+    because the whole point of this table is cross-cutting analysis
+    (per-agent accuracy, per-combo win rate, per agents-agree-count
+    bucket) that's easier to run over one table with a filter than to
+    UNION two tables for. See signal_lab.py for the read/write logic.
+
+Changes vs v5 (Signal Lab fee adjustment):
+  - Added `fee_usdt` / `net_pnl_usdt` to SignalOutcome. Raw price-move
+    PnL (`pnl_usdt`, kept as-is, now referred to as the GROSS figure)
+    overstates real profitability at the scale this bot trades at —
+    round-trip fees are frequently larger than the edge itself. Every
+    resolution now also computes a fee-adjusted NET figure; see
+    signal_lab.py's resolve_pending() and backfill_fees(). Because these
+    are new columns on a table that may already have real data in it
+    (unlike a brand-new install), `init_db()` now runs a small idempotent
+    SQLite migration (ALTER TABLE ADD COLUMN) after create_all(), since
+    SQLAlchemy's create_all() only creates missing TABLES — it does not
+    alter columns on tables that already exist.
 """
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
-from sqlalchemy import String, Float, Integer, DateTime, Text, Boolean, Index
+from sqlalchemy import String, Float, Integer, DateTime, Text, Boolean, Index, text
 
 
 DATABASE_URL = "sqlite+aiosqlite:///./data/apex7.db"
@@ -175,12 +199,92 @@ class FuturesPerformanceSnapshot(Base):
     recorded_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
+# ══════════════════════════════════════════════════
+#  SIGNAL LAB — "what if we'd taken this?" shadow
+#  tracking. One row per directional candidate per
+#  scan cycle, whether or not it became a real trade.
+# ══════════════════════════════════════════════════
+
+class SignalOutcome(Base):
+    __tablename__ = "signal_outcomes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_type: Mapped[str] = mapped_column(String(10))   # "SPOT" | "FUTURES"
+    symbol: Mapped[str] = mapped_column(String(20))
+    direction: Mapped[str] = mapped_column(String(10))      # "BUY" | "SELL"
+    entry_price: Mapped[float] = mapped_column(Float)
+
+    # Consensus state AT THE MOMENT this candidate was produced — includes
+    # candidates that never cleared MIN_CONSENSUS_SCORE / MIN_AGENTS_AGREE.
+    consensus_score: Mapped[float] = mapped_column(Float)
+    agents_agree: Mapped[int] = mapped_column(Integer)
+    total_agents: Mapped[int] = mapped_column(Integer)
+    regime: Mapped[str] = mapped_column(String(20), nullable=True)
+
+    # The SAME ATR-based exits the real engine would have used for this
+    # candidate, so the hypothetical trade is judged by the same rules
+    # as a real one — not some simplified fixed %.
+    stop_loss_pct: Mapped[float] = mapped_column(Float)
+    take_profit_pct: Mapped[float] = mapped_column(Float)
+    stop_loss_price: Mapped[float] = mapped_column(Float)
+    take_profit_price: Mapped[float] = mapped_column(Float)
+
+    # Whether this candidate actually cleared the gate and became a real
+    # order (allows separating "shadow-only" analysis from "confirms our
+    # real trades" analysis).
+    was_taken: Mapped[bool] = mapped_column(Boolean, default=False)
+    linked_trade_id: Mapped[int] = mapped_column(Integer, nullable=True)
+
+    # Per-agent snapshot for this cycle: JSON list of
+    # {agent, weight, timeframe, signal, confidence, agreed}. This is
+    # what lets analysis regroup by ANY combination after the fact
+    # without having had to pre-simulate all 2^8 subsets.
+    agent_detail_json: Mapped[str] = mapped_column(Text)
+
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")  # PENDING|TP|SL|EXPIRED
+    exit_price: Mapped[float] = mapped_column(Float, nullable=True)
+    pnl_pct: Mapped[float] = mapped_column(Float, nullable=True)    # raw price-move % in trade direction
+    pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)   # GROSS — on the fixed Signal Lab notional, before fees
+
+    # ── Fee adjustment (v5) ──
+    fee_usdt: Mapped[float] = mapped_column(Float, nullable=True)      # round-trip fee charged on the notional stake
+    net_pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)  # pnl_usdt - fee_usdt — the realistic figure
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    resolved_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_signal_outcomes_status", "status"),
+        Index("ix_signal_outcomes_symbol", "symbol"),
+        Index("ix_signal_outcomes_market_type", "market_type"),
+        Index("ix_signal_outcomes_created_at", "created_at"),
+    )
+
+
+async def _migrate_signal_outcomes_columns(conn):
+    """Idempotent SQLite migration: add any SignalOutcome columns that
+    don't exist yet on an ALREADY-CREATED table. Base.metadata.create_all()
+    only creates tables that are missing entirely — it silently does
+    nothing to a table that already exists with an older column set, so
+    a person who was already running Signal Lab before fee adjustment
+    shipped would otherwise get sqlite3.OperationalError: no such column
+    the first time resolve_pending() tries to write fee_usdt/net_pnl_usdt."""
+    result = await conn.execute(text("PRAGMA table_info(signal_outcomes)"))
+    existing_cols = {row[1] for row in result.fetchall()}  # row[1] = column name
+    if "fee_usdt" not in existing_cols:
+        await conn.execute(text("ALTER TABLE signal_outcomes ADD COLUMN fee_usdt FLOAT"))
+    if "net_pnl_usdt" not in existing_cols:
+        await conn.execute(text("ALTER TABLE signal_outcomes ADD COLUMN net_pnl_usdt FLOAT"))
+
+
 async def init_db():
-    """Create all tables (spot + futures)."""
+    """Create all tables (spot + futures + signal lab), then run any
+    small column migrations needed on tables that already existed."""
     import os
     os.makedirs("data", exist_ok=True)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _migrate_signal_outcomes_columns(conn)
 
 
 async def get_session() -> AsyncSession:

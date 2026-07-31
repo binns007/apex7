@@ -25,6 +25,26 @@ NEW — Futures Mode:
   - TRADING_MODE (testnet/live) is a single global safety switch shared
     by both spot and futures — flipping to "live" makes BOTH markets
     trade with real funds, using their respective credential pairs.
+
+NEW — Signal Lab ("what-if" shadow tracking):
+  - Every scan cycle produces a directional candidate (Momentum+OrderBook
+    leaning BUY, say) whether or not it clears MIN_CONSENSUS_SCORE /
+    MIN_AGENTS_AGREE. Previously that candidate was discarded the moment
+    the engine decided HOLD — there was no record of what WOULD have
+    happened had it been taken. Signal Lab records every such candidate
+    with its full per-agent breakdown and tracks it forward against the
+    same ATR-based SL/TP the engine would have used, whether or not a
+    real trade was ever opened. See signal_lab.py.
+
+NEW — Signal Lab fee adjustment:
+  - Raw price-move PnL massively overstates real profitability at the
+    tenths-of-a-percent scale this bot operates at — round-trip trading
+    fees are often larger than the "edge" itself. Every resolved shadow
+    outcome now also gets a GROSS (pre-fee) and NET (post-fee, using the
+    rates below) PnL, and all analytics (agent performance, combo
+    leaderboard, weight recommendations) are based on NET by default so
+    "what if we'd taken this?" reflects a real trading environment
+    rather than an idealized one. See signal_lab.py.
 """
 import os
 import math
@@ -126,6 +146,42 @@ class Settings:
 
     # ── Candle history depth per timeframe ────────────
     CANDLE_LIMIT: int = _env_int("CANDLE_LIMIT", 200)
+
+    # ══════════════════════════════════════════════════
+    #  SIGNAL LAB — "what if we'd taken this?" shadow
+    #  tracking + agent/weight analytics (spot + futures)
+    # ══════════════════════════════════════════════════
+    SIGNAL_LAB_ENABLED: bool = _env_bool("SIGNAL_LAB_ENABLED", True)
+    # How long a shadow candidate is allowed to sit PENDING before it's
+    # force-resolved at the current price (labeled EXPIRED rather than
+    # left open forever). Spot trades hold longer than futures scalps.
+    SIGNAL_LAB_MAX_HOLD_MINUTES: float = _env_float("SIGNAL_LAB_MAX_HOLD_MINUTES", 360.0)
+    FUTURES_SIGNAL_LAB_MAX_HOLD_MINUTES: float = _env_float("FUTURES_SIGNAL_LAB_MAX_HOLD_MINUTES", 90.0)
+    # Fixed hypothetical stake used to express every shadow outcome in
+    # comparable dollar terms, independent of whatever the real Risk
+    # Manager would have actually sized that trade at.
+    SIGNAL_LAB_NOTIONAL_USDT: float = _env_float("SIGNAL_LAB_NOTIONAL_USDT", 100.0)
+    # Minimum resolved samples before an agent/combo is surfaced in
+    # analytics — keeps single-digit-sample noise out of the leaderboard.
+    SIGNAL_LAB_MIN_SAMPLES: int = _env_int("SIGNAL_LAB_MIN_SAMPLES", 5)
+
+    # ── Fee adjustment ──────────────────────────────────
+    # Real round-trip cost applied to every resolved shadow outcome so
+    # "what if we'd taken this?" reflects actual trading costs, not just
+    # raw price movement. The bot's entries are always MARKET orders
+    # (taker). Spot exits go through an OCO whose take-profit leg COULD
+    # fill as maker if price reaches it passively, and futures exits are
+    # MARKET-triggered (STOP_MARKET/TAKE_PROFIT_MARKET, both taker) — we
+    # conservatively charge taker on both legs of every trade rather than
+    # assume the cheaper maker fill, since overstating cost is safer than
+    # overstating profit. Defaults match Binance's standard (non-BNB-
+    # discounted) fee schedule; override via env if your account has a
+    # different tier or BNB fee discount enabled.
+    # NOTE: slippage and (for futures) funding-rate carry cost are NOT
+    # modeled here — both are real costs a live account would also pay,
+    # so even these NET numbers are still a best case, not a worst case.
+    SIGNAL_LAB_SPOT_TAKER_FEE_PCT: float = _env_float("SIGNAL_LAB_SPOT_TAKER_FEE_PCT", 0.10)
+    SIGNAL_LAB_FUTURES_TAKER_FEE_PCT: float = _env_float("SIGNAL_LAB_FUTURES_TAKER_FEE_PCT", 0.05)
 
     # ══════════════════════════════════════════════════
     #  FUTURES MODE — same mechanism, tuned for fast,
@@ -272,6 +328,18 @@ class Settings:
                 "Futures Testnet keys are not set (BINANCE_FUTURES_TESTNET_API_KEY/SECRET) — "
                 "these are separate from the Spot Testnet keys, generate at testnet.binancefuture.com"
             )
+
+        # ── Signal Lab validation ──
+        if self.SIGNAL_LAB_MAX_HOLD_MINUTES <= 0:
+            problems.append("SIGNAL_LAB_MAX_HOLD_MINUTES must be > 0")
+        if self.FUTURES_SIGNAL_LAB_MAX_HOLD_MINUTES <= 0:
+            problems.append("FUTURES_SIGNAL_LAB_MAX_HOLD_MINUTES must be > 0")
+        if self.SIGNAL_LAB_NOTIONAL_USDT <= 0:
+            problems.append("SIGNAL_LAB_NOTIONAL_USDT must be > 0")
+        if self.SIGNAL_LAB_SPOT_TAKER_FEE_PCT < 0:
+            problems.append("SIGNAL_LAB_SPOT_TAKER_FEE_PCT must be >= 0")
+        if self.SIGNAL_LAB_FUTURES_TAKER_FEE_PCT < 0:
+            problems.append("SIGNAL_LAB_FUTURES_TAKER_FEE_PCT must be >= 0")
         return problems
 
 

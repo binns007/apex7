@@ -33,8 +33,28 @@ Changes vs v3 (Futures Mode):
     when the person toggles Spot/Futures.
   - lifespan() now also shuts down futures_market_data's HTTP session
     and stops the futures engine on app shutdown.
+
+Changes vs v4 (Signal Lab):
+  - New /api/signal-lab/* routes exposing the "what if we'd taken this
+    trade?" shadow-tracking data: raw outcomes, per-agent performance,
+    per-combination leaderboard, per-agents-agree-count performance,
+    and a weight-recommendation + apply-to-live-engine action. All
+    routes take an optional `market_type` (SPOT/FUTURES) query param
+    since Signal Lab data is stored in one shared table rather than
+    split per market.
+
+Changes vs v5 (Signal Lab fee adjustment):
+  - lifespan() now runs signal_lab.backfill_fees() once at startup,
+    after init_db(), so any resolved shadow outcomes from before fee
+    adjustment shipped get a retroactive NET (fee-adjusted) figure
+    instead of silently keeping the old, overstated GROSS-only numbers
+    forever. Safe to run on every startup — it only touches rows still
+    missing net_pnl_usdt.
+  - /api/signal-lab/outcomes now also returns `fee_usdt` and
+    `net_pnl_usdt` per row (GROSS pnl_usdt is unchanged/still present).
 """
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -49,11 +69,13 @@ from config import settings
 from database import (
     init_db, AsyncSessionLocal, Trade, AgentSignal, PerformanceSnapshot,
     FuturesTrade, FuturesAgentSignal, FuturesPerformanceSnapshot,
+    SignalOutcome,
 )
 from market_data import fetch_price, fetch_all_prices, fetch_candles, shutdown as market_data_shutdown
 import futures_market_data as fmd
 from trading_engine import engine
 from futures_trading_engine import futures_engine
+import signal_lab
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,7 +114,15 @@ ws_manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    logger.info("✅ Database initialized (spot + futures tables)")
+    logger.info("✅ Database initialized (spot + futures + signal lab tables)")
+
+    try:
+        backfilled = await signal_lab.backfill_fees()
+        if backfilled:
+            logger.info(f"✅ Signal Lab: fee-adjusted {backfilled} historical resolved rows")
+    except Exception as e:
+        logger.warning(f"⚠ Signal Lab fee backfill failed: {e}")
+
     problems = settings.validate()
     if problems:
         for p in problems:
@@ -106,7 +136,7 @@ async def lifespan(app: FastAPI):
     await fmd.shutdown()
 
 
-app = FastAPI(title="APEX-7 Trading Bot", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="APEX-7 Trading Bot", version="5.0.0", lifespan=lifespan)
 
 
 async def _ws_broadcaster():
@@ -167,6 +197,15 @@ def _futures_unrealized_pnl(trade: FuturesTrade, price: Optional[float]) -> tupl
     leveraged_pct = pnl_pct * (trade.leverage or 1)
     pnl_usdt = (trade.margin_usdt or 0.0) * leveraged_pct / 100
     return pnl_usdt, leveraged_pct
+
+
+def _market_type_param(market_type: Optional[str]) -> Optional[str]:
+    """Normalize/validate the market_type query param used across every
+    Signal Lab route. Returns None (= no filter) if missing/invalid."""
+    if not market_type:
+        return None
+    mt = market_type.upper()
+    return mt if mt in ("SPOT", "FUTURES") else None
 
 
 # ═══════════════════════════════════════════════════
@@ -662,6 +701,124 @@ async def api_update_futures_settings(body: FuturesSettingsUpdate):
         "leverage": futures_engine.leverage, "margin_type": futures_engine.margin_type,
         "config_warnings": warnings,
     }
+
+
+# ═══════════════════════════════════════════════════
+#  SIGNAL LAB API Routes — "what if we'd taken this?" analytics
+# ═══════════════════════════════════════════════════
+@app.get("/api/signal-lab/status")
+async def api_signal_lab_status(market_type: Optional[str] = None):
+    return await signal_lab.status_summary(_market_type_param(market_type))
+
+
+@app.post("/api/signal-lab/backfill-fees")
+async def api_signal_lab_backfill_fees():
+    """Manual trigger for the fee backfill (also runs automatically at
+    startup) — useful right after changing SIGNAL_LAB_*_TAKER_FEE_PCT so
+    historical rows immediately reflect the new rate without a restart.
+    NOTE: this only fills rows where net_pnl_usdt is NULL — it will NOT
+    recompute rows that already have a net figure from a previous rate."""
+    updated = await signal_lab.backfill_fees()
+    return {"ok": True, "rows_updated": updated}
+
+
+@app.get("/api/signal-lab/outcomes")
+async def api_signal_lab_outcomes(
+    market_type: Optional[str] = None,
+    symbol: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 100,
+):
+    mt = _market_type_param(market_type)
+    async with AsyncSessionLocal() as session:
+        q = select(SignalOutcome).order_by(desc(SignalOutcome.created_at)).limit(limit)
+        if mt:
+            q = q.where(SignalOutcome.market_type == mt)
+        if symbol:
+            q = q.where(SignalOutcome.symbol == symbol.upper())
+        if status:
+            q = q.where(SignalOutcome.status == status.upper())
+        result = await session.execute(q)
+        rows = result.scalars().all()
+
+    out = []
+    for r in rows:
+        try:
+            detail = json.loads(r.agent_detail_json or "[]")
+        except Exception:
+            detail = []
+        out.append({
+            "id": r.id,
+            "market_type": r.market_type,
+            "symbol": r.symbol,
+            "direction": r.direction,
+            "entry_price": r.entry_price,
+            "consensus_score": r.consensus_score,
+            "agents_agree": r.agents_agree,
+            "total_agents": r.total_agents,
+            "regime": r.regime,
+            "stop_loss_price": r.stop_loss_price,
+            "take_profit_price": r.take_profit_price,
+            "was_taken": r.was_taken,
+            "linked_trade_id": r.linked_trade_id,
+            "agent_detail": detail,
+            "status": r.status,
+            "exit_price": r.exit_price,
+            "pnl_pct": r.pnl_pct,
+            "pnl_usdt": r.pnl_usdt,              # GROSS — before fees
+            "fee_usdt": r.fee_usdt,
+            "net_pnl_usdt": r.net_pnl_usdt,       # NET — after fees (the realistic figure)
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "resolved_at": r.resolved_at.isoformat() if r.resolved_at else None,
+        })
+    return out
+
+
+@app.get("/api/signal-lab/agent-performance")
+async def api_signal_lab_agent_performance(
+    market_type: Optional[str] = None, symbol: Optional[str] = None, min_samples: Optional[int] = None,
+):
+    return await signal_lab.agent_performance(
+        _market_type_param(market_type), symbol.upper() if symbol else None, min_samples,
+    )
+
+
+@app.get("/api/signal-lab/combo-performance")
+async def api_signal_lab_combo_performance(
+    market_type: Optional[str] = None, symbol: Optional[str] = None,
+    min_samples: Optional[int] = None, max_combos: int = 30,
+):
+    return await signal_lab.combo_performance(
+        _market_type_param(market_type), symbol.upper() if symbol else None, min_samples, max_combos,
+    )
+
+
+@app.get("/api/signal-lab/agents-agree-performance")
+async def api_signal_lab_agree_performance(market_type: Optional[str] = None, symbol: Optional[str] = None):
+    return await signal_lab.agents_agree_bucket_performance(
+        _market_type_param(market_type), symbol.upper() if symbol else None,
+    )
+
+
+@app.get("/api/signal-lab/weight-recommendations")
+async def api_signal_lab_weight_recommendations(market_type: Optional[str] = None, min_samples: Optional[int] = None):
+    mt = _market_type_param(market_type) or "SPOT"
+    eng = futures_engine if mt == "FUTURES" else engine
+    base_weights = {a.name: a.weight for a in eng.consensus.agents}
+    return await signal_lab.recommend_weights(mt, min_samples, base_weights)
+
+
+class ApplyWeightsBody(BaseModel):
+    market_type: str
+    weights: dict[str, float]
+
+
+@app.post("/api/signal-lab/apply-weights")
+async def api_signal_lab_apply_weights(body: ApplyWeightsBody):
+    mt = _market_type_param(body.market_type) or "SPOT"
+    eng = futures_engine if mt == "FUTURES" else engine
+    applied = eng.apply_agent_weights(body.weights)
+    return {"ok": True, "market_type": mt, "applied_weights": applied}
 
 
 # ═══════════════════════════════════════════════════
