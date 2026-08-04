@@ -1,5 +1,5 @@
 """
-APEX-7 Database Layer
+APEX-8 Database Layer
 SQLite via SQLAlchemy — stores trades, signals, and performance snapshots.
 
 Changes vs v1: added indices on the columns actually queried
@@ -35,17 +35,21 @@ Changes vs v4 (Signal Lab):
     UNION two tables for. See signal_lab.py for the read/write logic.
 
 Changes vs v5 (Signal Lab fee adjustment):
-  - Added `fee_usdt` / `net_pnl_usdt` to SignalOutcome. Raw price-move
-    PnL (`pnl_usdt`, kept as-is, now referred to as the GROSS figure)
-    overstates real profitability at the scale this bot trades at —
-    round-trip fees are frequently larger than the edge itself. Every
-    resolution now also computes a fee-adjusted NET figure; see
-    signal_lab.py's resolve_pending() and backfill_fees(). Because these
-    are new columns on a table that may already have real data in it
-    (unlike a brand-new install), `init_db()` now runs a small idempotent
-    SQLite migration (ALTER TABLE ADD COLUMN) after create_all(), since
-    SQLAlchemy's create_all() only creates missing TABLES — it does not
-    alter columns on tables that already exist.
+  - Added `fee_usdt` / `net_pnl_usdt` to SignalOutcome.
+
+Changes vs v6 (real-trade fee adjustment):
+  - Added `fee_usdt` / `net_pnl_usdt` / `net_pnl_pct` to Trade AND
+    FuturesTrade too — the fee adjustment that used to only apply to
+    Signal Lab's shadow candidates now applies to real closed trades as
+    well, so "Realized PnL" on the dashboard reflects actual trading
+    costs. `pnl_usdt` / `pnl_pct` are unchanged in meaning (GROSS, raw
+    price move) — the new columns are the NET (post-fee) figures.
+  - Because these are new columns on tables that may already have real
+    trade history in them (not a fresh install), `init_db()` runs a
+    small idempotent SQLite migration (ALTER TABLE ADD COLUMN) after
+    create_all() for every table that might need it — SQLAlchemy's
+    create_all() only creates missing TABLES, it never alters columns
+    on a table that already exists.
 """
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -76,8 +80,11 @@ class Trade(Base):
     risk_usdt: Mapped[float] = mapped_column(Float, nullable=True)  # $ risked per trade
     stop_loss: Mapped[float] = mapped_column(Float, nullable=True)
     take_profit: Mapped[float] = mapped_column(Float, nullable=True)
-    pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)
-    pnl_pct: Mapped[float] = mapped_column(Float, nullable=True)
+    pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)   # GROSS — raw price move, before fees
+    pnl_pct: Mapped[float] = mapped_column(Float, nullable=True)    # GROSS
+    fee_usdt: Mapped[float] = mapped_column(Float, nullable=True)       # round-trip fee (v6)
+    net_pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)   # pnl_usdt - fee_usdt (v6)
+    net_pnl_pct: Mapped[float] = mapped_column(Float, nullable=True)    # net_pnl_usdt as % of usdt_value (v6)
     status: Mapped[str] = mapped_column(String(20), default="OPEN")
     consensus_score: Mapped[float] = mapped_column(Float, nullable=True)
     agents_agree: Mapped[int] = mapped_column(Integer, nullable=True)
@@ -148,8 +155,11 @@ class FuturesTrade(Base):
     stop_loss: Mapped[float] = mapped_column(Float, nullable=True)
     take_profit: Mapped[float] = mapped_column(Float, nullable=True)
     liquidation_price: Mapped[float] = mapped_column(Float, nullable=True)  # estimate at entry
-    pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)
-    pnl_pct: Mapped[float] = mapped_column(Float, nullable=True)  # ROI on MARGIN (leverage-adjusted)
+    pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)   # GROSS $, before fees
+    pnl_pct: Mapped[float] = mapped_column(Float, nullable=True)    # GROSS ROI on MARGIN (leverage-adjusted)
+    fee_usdt: Mapped[float] = mapped_column(Float, nullable=True)       # round-trip fee, charged on NOTIONAL (v6)
+    net_pnl_usdt: Mapped[float] = mapped_column(Float, nullable=True)   # pnl_usdt - fee_usdt (v6)
+    net_pnl_pct: Mapped[float] = mapped_column(Float, nullable=True)    # net_pnl_usdt as ROI on MARGIN (v6)
     status: Mapped[str] = mapped_column(String(20), default="OPEN")   # OPEN | CLOSED | LIQUIDATED
     consensus_score: Mapped[float] = mapped_column(Float, nullable=True)
     agents_agree: Mapped[int] = mapped_column(Integer, nullable=True)
@@ -261,20 +271,20 @@ class SignalOutcome(Base):
     )
 
 
-async def _migrate_signal_outcomes_columns(conn):
-    """Idempotent SQLite migration: add any SignalOutcome columns that
-    don't exist yet on an ALREADY-CREATED table. Base.metadata.create_all()
-    only creates tables that are missing entirely — it silently does
-    nothing to a table that already exists with an older column set, so
-    a person who was already running Signal Lab before fee adjustment
-    shipped would otherwise get sqlite3.OperationalError: no such column
-    the first time resolve_pending() tries to write fee_usdt/net_pnl_usdt."""
-    result = await conn.execute(text("PRAGMA table_info(signal_outcomes)"))
+async def _add_missing_columns(conn, table_name: str, columns: dict[str, str]):
+    """Idempotent SQLite migration: add any columns in `columns` (name ->
+    SQL type) that don't already exist on `table_name`. Safe to call on
+    every startup — Base.metadata.create_all() only creates tables that
+    are missing ENTIRELY, it does nothing to a table that already exists
+    with an older column set, so without this a person upgrading with
+    real history already in their DB would hit
+    sqlite3.OperationalError: no such column the first time the app
+    tried to write one of the new fee/net columns."""
+    result = await conn.execute(text(f"PRAGMA table_info({table_name})"))
     existing_cols = {row[1] for row in result.fetchall()}  # row[1] = column name
-    if "fee_usdt" not in existing_cols:
-        await conn.execute(text("ALTER TABLE signal_outcomes ADD COLUMN fee_usdt FLOAT"))
-    if "net_pnl_usdt" not in existing_cols:
-        await conn.execute(text("ALTER TABLE signal_outcomes ADD COLUMN net_pnl_usdt FLOAT"))
+    for col_name, col_type in columns.items():
+        if col_name not in existing_cols:
+            await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"))
 
 
 async def init_db():
@@ -284,7 +294,15 @@ async def init_db():
     os.makedirs("data", exist_ok=True)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        await _migrate_signal_outcomes_columns(conn)
+        await _add_missing_columns(conn, "signal_outcomes", {
+            "fee_usdt": "FLOAT", "net_pnl_usdt": "FLOAT",
+        })
+        await _add_missing_columns(conn, "trades", {
+            "fee_usdt": "FLOAT", "net_pnl_usdt": "FLOAT", "net_pnl_pct": "FLOAT",
+        })
+        await _add_missing_columns(conn, "futures_trades", {
+            "fee_usdt": "FLOAT", "net_pnl_usdt": "FLOAT", "net_pnl_pct": "FLOAT",
+        })
 
 
 async def get_session() -> AsyncSession:

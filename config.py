@@ -1,5 +1,5 @@
 """
-APEX-7 Configuration
+APEX-8 Configuration
 ═════════════════════
 All runtime knobs live here. Every threshold that used to be a magic
 number buried in an agent or the consensus engine is now surfaced here,
@@ -36,15 +36,20 @@ NEW — Signal Lab ("what-if" shadow tracking):
     same ATR-based SL/TP the engine would have used, whether or not a
     real trade was ever opened. See signal_lab.py.
 
-NEW — Signal Lab fee adjustment:
-  - Raw price-move PnL massively overstates real profitability at the
-    tenths-of-a-percent scale this bot operates at — round-trip trading
-    fees are often larger than the "edge" itself. Every resolved shadow
-    outcome now also gets a GROSS (pre-fee) and NET (post-fee, using the
-    rates below) PnL, and all analytics (agent performance, combo
-    leaderboard, weight recommendations) are based on NET by default so
-    "what if we'd taken this?" reflects a real trading environment
-    rather than an idealized one. See signal_lab.py.
+NEW — Fee adjustment (real trades AND Signal Lab shadow trades):
+  - SPOT_TAKER_FEE_PCT / FUTURES_TAKER_FEE_PCT below are the single
+    source of truth for round-trip trading cost, used in TWO places:
+      1. signal_lab.py — every resolved shadow outcome gets a GROSS
+         (raw price move) and NET (fee-adjusted) PnL.
+      2. trading_engine.py / futures_trading_engine.py — every REAL
+         closed trade now also gets fee_usdt/net_pnl_usdt/net_pnl_pct
+         persisted, and net_pnl_usdt (not gross) is what feeds the Risk
+         Manager's win/loss bookkeeping (Kelly win-rate estimate,
+         drawdown tracking) — see the trading engines for why.
+  - Both entry (always MARKET) and exit are conservatively charged at
+    the TAKER rate on both legs; slippage and futures funding-rate
+    carry cost are still NOT modeled anywhere, so even these NET
+    numbers remain a best case, not a true worst case.
 """
 import os
 import math
@@ -148,6 +153,23 @@ class Settings:
     CANDLE_LIMIT: int = _env_int("CANDLE_LIMIT", 200)
 
     # ══════════════════════════════════════════════════
+    #  TRADING FEES — used for BOTH real trade PnL display
+    #  (trading_engine.py / futures_trading_engine.py) AND
+    #  Signal Lab's fee-adjusted shadow PnL (signal_lab.py)
+    # ══════════════════════════════════════════════════
+    # Per-SIDE taker rate. Both engines always enter with a MARKET order
+    # (taker). Spot exits go through an OCO whose take-profit leg COULD
+    # fill as maker if price reaches it passively; futures exits are
+    # MARKET-triggered (STOP_MARKET/TAKE_PROFIT_MARKET, always taker).
+    # We conservatively charge taker on BOTH legs of every trade rather
+    # than assume the cheaper maker fill — overstating cost is safer
+    # than overstating profit. Defaults match Binance's standard
+    # (non-BNB-discounted) fee schedule; override via env if your
+    # account has a different tier or a BNB fee discount enabled.
+    SPOT_TAKER_FEE_PCT: float = _env_float("SPOT_TAKER_FEE_PCT", 0.10)
+    FUTURES_TAKER_FEE_PCT: float = _env_float("FUTURES_TAKER_FEE_PCT", 0.05)
+
+    # ══════════════════════════════════════════════════
     #  SIGNAL LAB — "what if we'd taken this?" shadow
     #  tracking + agent/weight analytics (spot + futures)
     # ══════════════════════════════════════════════════
@@ -164,24 +186,6 @@ class Settings:
     # Minimum resolved samples before an agent/combo is surfaced in
     # analytics — keeps single-digit-sample noise out of the leaderboard.
     SIGNAL_LAB_MIN_SAMPLES: int = _env_int("SIGNAL_LAB_MIN_SAMPLES", 5)
-
-    # ── Fee adjustment ──────────────────────────────────
-    # Real round-trip cost applied to every resolved shadow outcome so
-    # "what if we'd taken this?" reflects actual trading costs, not just
-    # raw price movement. The bot's entries are always MARKET orders
-    # (taker). Spot exits go through an OCO whose take-profit leg COULD
-    # fill as maker if price reaches it passively, and futures exits are
-    # MARKET-triggered (STOP_MARKET/TAKE_PROFIT_MARKET, both taker) — we
-    # conservatively charge taker on both legs of every trade rather than
-    # assume the cheaper maker fill, since overstating cost is safer than
-    # overstating profit. Defaults match Binance's standard (non-BNB-
-    # discounted) fee schedule; override via env if your account has a
-    # different tier or BNB fee discount enabled.
-    # NOTE: slippage and (for futures) funding-rate carry cost are NOT
-    # modeled here — both are real costs a live account would also pay,
-    # so even these NET numbers are still a best case, not a worst case.
-    SIGNAL_LAB_SPOT_TAKER_FEE_PCT: float = _env_float("SIGNAL_LAB_SPOT_TAKER_FEE_PCT", 0.10)
-    SIGNAL_LAB_FUTURES_TAKER_FEE_PCT: float = _env_float("SIGNAL_LAB_FUTURES_TAKER_FEE_PCT", 0.05)
 
     # ══════════════════════════════════════════════════
     #  FUTURES MODE — same mechanism, tuned for fast,
@@ -329,17 +333,17 @@ class Settings:
                 "these are separate from the Spot Testnet keys, generate at testnet.binancefuture.com"
             )
 
-        # ── Signal Lab validation ──
+        # ── Signal Lab / fee validation ──
         if self.SIGNAL_LAB_MAX_HOLD_MINUTES <= 0:
             problems.append("SIGNAL_LAB_MAX_HOLD_MINUTES must be > 0")
         if self.FUTURES_SIGNAL_LAB_MAX_HOLD_MINUTES <= 0:
             problems.append("FUTURES_SIGNAL_LAB_MAX_HOLD_MINUTES must be > 0")
         if self.SIGNAL_LAB_NOTIONAL_USDT <= 0:
             problems.append("SIGNAL_LAB_NOTIONAL_USDT must be > 0")
-        if self.SIGNAL_LAB_SPOT_TAKER_FEE_PCT < 0:
-            problems.append("SIGNAL_LAB_SPOT_TAKER_FEE_PCT must be >= 0")
-        if self.SIGNAL_LAB_FUTURES_TAKER_FEE_PCT < 0:
-            problems.append("SIGNAL_LAB_FUTURES_TAKER_FEE_PCT must be >= 0")
+        if self.SPOT_TAKER_FEE_PCT < 0:
+            problems.append("SPOT_TAKER_FEE_PCT must be >= 0")
+        if self.FUTURES_TAKER_FEE_PCT < 0:
+            problems.append("FUTURES_TAKER_FEE_PCT must be >= 0")
         return problems
 
 
@@ -348,6 +352,6 @@ settings = Settings()
 _problems = settings.validate()
 if _problems:
     import logging
-    _log = logging.getLogger("apex7.config")
+    _log = logging.getLogger("apex8.config")
     for p in _problems:
         _log.warning("⚠ Config issue: %s", p)
