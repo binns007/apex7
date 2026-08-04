@@ -1,5 +1,5 @@
 """
-APEX-7 FastAPI Application
+APEX-8 FastAPI Application
 ══════════════════════════
 REST + WebSocket API powering the dashboard UI.
 
@@ -52,6 +52,21 @@ Changes vs v5 (Signal Lab fee adjustment):
     missing net_pnl_usdt.
   - /api/signal-lab/outcomes now also returns `fee_usdt` and
     `net_pnl_usdt` per row (GROSS pnl_usdt is unchanged/still present).
+
+Changes vs v6 (real-trade fee adjustment):
+  - _unrealized_pnl() / _futures_unrealized_pnl() now also return a
+    live fee ESTIMATE and NET pnl for still-OPEN positions, and
+    /api/trades, /api/futures/trades now expose fee_usdt/net_pnl_usdt/
+    net_pnl_pct for CLOSED trades (persisted) and
+    unrealized_fee_usdt/unrealized_net_pnl_usdt/unrealized_net_pnl_pct
+    for OPEN ones (live estimate).
+  - /api/performance and /api/futures/performance now report
+    total_fees_usdt / total_net_pnl_usdt / net_win_rate_pct for closed
+    trades, and unrealized_net_pnl_usdt / combined_net_pnl_usdt
+    alongside the existing GROSS figures.
+  - lifespan() now also runs a one-time backfill for historical CLOSED
+    real trades that predate this feature (mirrors Signal Lab's own
+    backfill_fees(), but for Trade/FuturesTrade instead of SignalOutcome).
 """
 import asyncio
 import json
@@ -82,7 +97,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("apex7.api")
+logger = logging.getLogger("apex8.api")
 
 
 class ConnectionManager:
@@ -111,6 +126,51 @@ class ConnectionManager:
 ws_manager = ConnectionManager()
 
 
+async def _backfill_trade_fees() -> int:
+    """One-time-per-row (safe on every startup — only touches rows still
+    missing net_pnl_usdt) retroactive fee/net-PnL computation for REAL
+    trades that closed BEFORE this feature existed. Mirrors
+    signal_lab.backfill_fees(), but for Trade/FuturesTrade instead of
+    the shadow SignalOutcome table."""
+    updated = 0
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Trade).where(Trade.status == "CLOSED", Trade.net_pnl_usdt.is_(None))
+        )
+        rows = result.scalars().all()
+        for t in rows:
+            fee = round((t.usdt_value or 0.0) * (settings.SPOT_TAKER_FEE_PCT * 2 / 100), 4)
+            net_usdt = round((t.pnl_usdt or 0.0) - fee, 4)
+            net_pct = round(net_usdt / t.usdt_value * 100, 4) if t.usdt_value else t.pnl_pct
+            t.fee_usdt, t.net_pnl_usdt, t.net_pnl_pct = fee, net_usdt, net_pct
+            updated += 1
+        if rows:
+            await session.commit()
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(FuturesTrade).where(
+                FuturesTrade.status.in_(["CLOSED", "LIQUIDATED"]),
+                FuturesTrade.net_pnl_usdt.is_(None),
+            )
+        )
+        rows = result.scalars().all()
+        for t in rows:
+            # Futures fees are charged on NOTIONAL (usdt_value), but PnL%
+            # is expressed as ROI-on-MARGIN, matching how the live close
+            # path computes it (see futures_trading_engine.py).
+            fee = round((t.usdt_value or 0.0) * (settings.FUTURES_TAKER_FEE_PCT * 2 / 100), 4)
+            net_usdt = round((t.pnl_usdt or 0.0) - fee, 4)
+            net_pct = round(net_usdt / t.margin_usdt * 100, 4) if t.margin_usdt else t.pnl_pct
+            t.fee_usdt, t.net_pnl_usdt, t.net_pnl_pct = fee, net_usdt, net_pct
+            updated += 1
+        if rows:
+            await session.commit()
+
+    return updated
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -122,6 +182,13 @@ async def lifespan(app: FastAPI):
             logger.info(f"✅ Signal Lab: fee-adjusted {backfilled} historical resolved rows")
     except Exception as e:
         logger.warning(f"⚠ Signal Lab fee backfill failed: {e}")
+
+    try:
+        trades_backfilled = await _backfill_trade_fees()
+        if trades_backfilled:
+            logger.info(f"✅ Backfilled fee adjustment on {trades_backfilled} historical closed real trades")
+    except Exception as e:
+        logger.warning(f"⚠ Real trade fee backfill failed: {e}")
 
     problems = settings.validate()
     if problems:
@@ -136,7 +203,7 @@ async def lifespan(app: FastAPI):
     await fmd.shutdown()
 
 
-app = FastAPI(title="APEX-7 Trading Bot", version="5.0.0", lifespan=lifespan)
+app = FastAPI(title="APEX-8 Trading Bot", version="6.0.0", lifespan=lifespan)
 
 
 async def _ws_broadcaster():
@@ -172,31 +239,40 @@ async def _ws_broadcaster():
 # ─────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────
-def _unrealized_pnl(trade: Trade, price: Optional[float]) -> tuple[Optional[float], Optional[float]]:
-    """Return (unrealized_pnl_usdt, unrealized_pnl_pct) for an OPEN spot
-    trade given a live price, or (None, None) if price isn't available."""
+def _unrealized_pnl(trade: Trade, price: Optional[float]):
+    """Return (gross_usdt, gross_pct, fee_usdt, net_usdt, net_pct) for an
+    OPEN spot trade given a live price — fee/net here are an ESTIMATE
+    (what it would cost/net to close right now), since the exit hasn't
+    actually happened yet. Returns all-None if price isn't available."""
     if not price or price <= 0 or not trade.entry_price:
-        return None, None
+        return None, None, None, None, None
     pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
     if trade.side == "SELL":
         pnl_pct = -pnl_pct
     pnl_usdt = (trade.usdt_value or 0.0) * pnl_pct / 100
-    return pnl_usdt, pnl_pct
+    fee_usdt = (trade.usdt_value or 0.0) * (settings.SPOT_TAKER_FEE_PCT * 2 / 100)
+    net_usdt = pnl_usdt - fee_usdt
+    net_pct = (net_usdt / trade.usdt_value * 100) if trade.usdt_value else pnl_pct
+    return pnl_usdt, pnl_pct, fee_usdt, net_usdt, net_pct
 
 
-def _futures_unrealized_pnl(trade: FuturesTrade, price: Optional[float]) -> tuple[Optional[float], Optional[float]]:
-    """Return (unrealized_pnl_usdt, unrealized_pnl_pct) for an OPEN
-    futures trade. pnl_pct here is ROI-on-MARGIN (leverage-adjusted),
-    matching how Binance itself displays futures PnL% — NOT the raw
-    price move %, which is what the spot version returns."""
+def _futures_unrealized_pnl(trade: FuturesTrade, price: Optional[float]):
+    """Return (gross_usdt, gross_pct, fee_usdt, net_usdt, net_pct) for an
+    OPEN futures trade. gross_pct/net_pct are ROI-on-MARGIN (leverage-
+    adjusted), matching how Binance itself displays futures PnL% — NOT
+    the raw price move %, which is what the spot version returns. Fee is
+    charged on NOTIONAL (trade.usdt_value), not margin."""
     if not price or price <= 0 or not trade.entry_price:
-        return None, None
+        return None, None, None, None, None
     pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
     if trade.side == "SELL":
         pnl_pct = -pnl_pct
     leveraged_pct = pnl_pct * (trade.leverage or 1)
     pnl_usdt = (trade.margin_usdt or 0.0) * leveraged_pct / 100
-    return pnl_usdt, leveraged_pct
+    fee_usdt = (trade.usdt_value or 0.0) * (settings.FUTURES_TAKER_FEE_PCT * 2 / 100)
+    net_usdt = pnl_usdt - fee_usdt
+    net_pct = (net_usdt / trade.margin_usdt * 100) if trade.margin_usdt else leveraged_pct
+    return pnl_usdt, leveraged_pct, fee_usdt, net_usdt, net_pct
 
 
 def _market_type_param(market_type: Optional[str]) -> Optional[str]:
@@ -209,7 +285,7 @@ def _market_type_param(market_type: Optional[str]) -> Optional[str]:
 
 
 # ═══════════════════════════════════════════════════
-#  SPOT API Routes (unchanged)
+#  SPOT API Routes
 # ═══════════════════════════════════════════════════
 @app.get("/api/status")
 async def api_status():
@@ -255,9 +331,9 @@ async def api_trades(limit: int = 50, status: Optional[str] = None):
 
     out = []
     for t in trades:
-        unrealized_usdt, unrealized_pct = (None, None)
+        u_gross, u_gross_pct, u_fee, u_net, u_net_pct = (None,) * 5
         if t.status == "OPEN":
-            unrealized_usdt, unrealized_pct = _unrealized_pnl(t, live_prices.get(t.symbol))
+            u_gross, u_gross_pct, u_fee, u_net, u_net_pct = _unrealized_pnl(t, live_prices.get(t.symbol))
 
         out.append({
             "id": t.id,
@@ -270,10 +346,16 @@ async def api_trades(limit: int = 50, status: Optional[str] = None):
             "risk_usdt": t.risk_usdt,
             "stop_loss": t.stop_loss,
             "take_profit": t.take_profit,
-            "pnl_usdt": t.pnl_usdt,
-            "pnl_pct": t.pnl_pct,
-            "unrealized_pnl_usdt": round(unrealized_usdt, 4) if unrealized_usdt is not None else None,
-            "unrealized_pnl_pct": round(unrealized_pct, 4) if unrealized_pct is not None else None,
+            "pnl_usdt": t.pnl_usdt,                # GROSS — closed trades only
+            "pnl_pct": t.pnl_pct,                  # GROSS
+            "fee_usdt": t.fee_usdt,                # persisted, closed trades only
+            "net_pnl_usdt": t.net_pnl_usdt,        # persisted, closed trades only
+            "net_pnl_pct": t.net_pnl_pct,          # persisted, closed trades only
+            "unrealized_pnl_usdt": round(u_gross, 4) if u_gross is not None else None,
+            "unrealized_pnl_pct": round(u_gross_pct, 4) if u_gross_pct is not None else None,
+            "unrealized_fee_usdt": round(u_fee, 4) if u_fee is not None else None,
+            "unrealized_net_pnl_usdt": round(u_net, 4) if u_net is not None else None,
+            "unrealized_net_pnl_pct": round(u_net_pct, 4) if u_net_pct is not None else None,
             "status": t.status,
             "consensus_score": t.consensus_score,
             "agents_agree": t.agents_agree,
@@ -300,15 +382,18 @@ async def api_performance():
         open_trades = open_result.scalars().all()
 
     unrealized_pnl_usdt = 0.0
+    unrealized_net_pnl_usdt = 0.0
     if open_trades:
         try:
             live_prices = await fetch_all_prices(list({t.symbol for t in open_trades}))
         except Exception:
             live_prices = {}
         for t in open_trades:
-            pnl_usdt, _ = _unrealized_pnl(t, live_prices.get(t.symbol))
-            if pnl_usdt is not None:
-                unrealized_pnl_usdt += pnl_usdt
+            g, _, _, n, _ = _unrealized_pnl(t, live_prices.get(t.symbol))
+            if g is not None:
+                unrealized_pnl_usdt += g
+            if n is not None:
+                unrealized_net_pnl_usdt += n
 
     if not closed:
         base = {
@@ -317,6 +402,7 @@ async def api_performance():
             "avg_win_usdt": 0, "avg_loss_usdt": 0,
             "profit_factor": 0, "best_trade_pct": 0, "worst_trade_pct": 0,
             "avg_hold_minutes": 0,
+            "total_fees_usdt": 0, "total_net_pnl_usdt": 0, "net_win_rate_pct": 0,
         }
     else:
         wins = [t for t in closed if (t.pnl_usdt or 0) > 0]
@@ -324,6 +410,11 @@ async def api_performance():
         total_pnl = sum(t.pnl_usdt or 0 for t in closed)
         gross_profit = sum(t.pnl_usdt for t in wins) if wins else 0
         gross_loss = abs(sum(t.pnl_usdt for t in losses)) if losses else 1
+
+        total_fees = sum(t.fee_usdt or 0.0 for t in closed)
+        net_pnls = [(t.net_pnl_usdt if t.net_pnl_usdt is not None else (t.pnl_usdt or 0.0)) for t in closed]
+        total_net_pnl = sum(net_pnls)
+        net_wins = sum(1 for v in net_pnls if v > 0)
 
         hold_minutes = []
         for t in closed:
@@ -343,11 +434,16 @@ async def api_performance():
             "best_trade_pct": round(max((t.pnl_pct or 0) for t in closed), 3),
             "worst_trade_pct": round(min((t.pnl_pct or 0) for t in closed), 3),
             "avg_hold_minutes": round(sum(hold_minutes) / len(hold_minutes), 1) if hold_minutes else 0,
+            "total_fees_usdt": round(total_fees, 4),
+            "total_net_pnl_usdt": round(total_net_pnl, 4),
+            "net_win_rate_pct": round(net_wins / len(closed) * 100, 2),
         }
 
     base["open_trades_count"] = len(open_trades)
     base["unrealized_pnl_usdt"] = round(unrealized_pnl_usdt, 4)
+    base["unrealized_net_pnl_usdt"] = round(unrealized_net_pnl_usdt, 4)
     base["combined_pnl_usdt"] = round(base["total_pnl_usdt"] + unrealized_pnl_usdt, 4)
+    base["combined_net_pnl_usdt"] = round(base["total_net_pnl_usdt"] + unrealized_net_pnl_usdt, 4)
     return base
 
 
@@ -500,9 +596,9 @@ async def api_futures_trades(limit: int = 50, status: Optional[str] = None):
 
     out = []
     for t in trades:
-        unrealized_usdt, unrealized_pct = (None, None)
+        u_gross, u_gross_pct, u_fee, u_net, u_net_pct = (None,) * 5
         if t.status == "OPEN":
-            unrealized_usdt, unrealized_pct = _futures_unrealized_pnl(t, live_prices.get(t.symbol))
+            u_gross, u_gross_pct, u_fee, u_net, u_net_pct = _futures_unrealized_pnl(t, live_prices.get(t.symbol))
 
         out.append({
             "id": t.id,
@@ -519,10 +615,16 @@ async def api_futures_trades(limit: int = 50, status: Optional[str] = None):
             "stop_loss": t.stop_loss,
             "take_profit": t.take_profit,
             "liquidation_price": t.liquidation_price,
-            "pnl_usdt": t.pnl_usdt,
-            "pnl_pct": t.pnl_pct,                  # ROI on margin at close
-            "unrealized_pnl_usdt": round(unrealized_usdt, 4) if unrealized_usdt is not None else None,
-            "unrealized_pnl_pct": round(unrealized_pct, 4) if unrealized_pct is not None else None,
+            "pnl_usdt": t.pnl_usdt,                # GROSS — closed trades only
+            "pnl_pct": t.pnl_pct,                  # GROSS ROI on margin at close
+            "fee_usdt": t.fee_usdt,                # persisted, closed trades only
+            "net_pnl_usdt": t.net_pnl_usdt,        # persisted, closed trades only
+            "net_pnl_pct": t.net_pnl_pct,          # persisted, closed trades only
+            "unrealized_pnl_usdt": round(u_gross, 4) if u_gross is not None else None,
+            "unrealized_pnl_pct": round(u_gross_pct, 4) if u_gross_pct is not None else None,
+            "unrealized_fee_usdt": round(u_fee, 4) if u_fee is not None else None,
+            "unrealized_net_pnl_usdt": round(u_net, 4) if u_net is not None else None,
+            "unrealized_net_pnl_pct": round(u_net_pct, 4) if u_net_pct is not None else None,
             "status": t.status,
             "consensus_score": t.consensus_score,
             "agents_agree": t.agents_agree,
@@ -549,15 +651,18 @@ async def api_futures_performance():
         open_trades = open_result.scalars().all()
 
     unrealized_pnl_usdt = 0.0
+    unrealized_net_pnl_usdt = 0.0
     if open_trades:
         try:
             live_prices = await fmd.fetch_all_prices(list({t.symbol for t in open_trades}))
         except Exception:
             live_prices = {}
         for t in open_trades:
-            pnl_usdt, _ = _futures_unrealized_pnl(t, live_prices.get(t.symbol))
-            if pnl_usdt is not None:
-                unrealized_pnl_usdt += pnl_usdt
+            g, _, _, n, _ = _futures_unrealized_pnl(t, live_prices.get(t.symbol))
+            if g is not None:
+                unrealized_pnl_usdt += g
+            if n is not None:
+                unrealized_net_pnl_usdt += n
 
     if not closed:
         base = {
@@ -566,6 +671,7 @@ async def api_futures_performance():
             "avg_win_usdt": 0, "avg_loss_usdt": 0,
             "profit_factor": 0, "best_trade_pct": 0, "worst_trade_pct": 0,
             "avg_hold_minutes": 0,
+            "total_fees_usdt": 0, "total_net_pnl_usdt": 0, "net_win_rate_pct": 0,
         }
     else:
         wins = [t for t in closed if (t.pnl_usdt or 0) > 0]
@@ -574,6 +680,11 @@ async def api_futures_performance():
         total_pnl = sum(t.pnl_usdt or 0 for t in closed)
         gross_profit = sum(t.pnl_usdt for t in wins) if wins else 0
         gross_loss = abs(sum(t.pnl_usdt for t in losses)) if losses else 1
+
+        total_fees = sum(t.fee_usdt or 0.0 for t in closed)
+        net_pnls = [(t.net_pnl_usdt if t.net_pnl_usdt is not None else (t.pnl_usdt or 0.0)) for t in closed]
+        total_net_pnl = sum(net_pnls)
+        net_wins = sum(1 for v in net_pnls if v > 0)
 
         hold_minutes = []
         for t in closed:
@@ -594,11 +705,16 @@ async def api_futures_performance():
             "best_trade_pct": round(max((t.pnl_pct or 0) for t in closed), 3),
             "worst_trade_pct": round(min((t.pnl_pct or 0) for t in closed), 3),
             "avg_hold_minutes": round(sum(hold_minutes) / len(hold_minutes), 1) if hold_minutes else 0,
+            "total_fees_usdt": round(total_fees, 4),
+            "total_net_pnl_usdt": round(total_net_pnl, 4),
+            "net_win_rate_pct": round(net_wins / len(closed) * 100, 2),
         }
 
     base["open_trades_count"] = len(open_trades)
     base["unrealized_pnl_usdt"] = round(unrealized_pnl_usdt, 4)
+    base["unrealized_net_pnl_usdt"] = round(unrealized_net_pnl_usdt, 4)
     base["combined_pnl_usdt"] = round(base["total_pnl_usdt"] + unrealized_pnl_usdt, 4)
+    base["combined_net_pnl_usdt"] = round(base["total_net_pnl_usdt"] + unrealized_net_pnl_usdt, 4)
     return base
 
 
@@ -714,10 +830,11 @@ async def api_signal_lab_status(market_type: Optional[str] = None):
 @app.post("/api/signal-lab/backfill-fees")
 async def api_signal_lab_backfill_fees():
     """Manual trigger for the fee backfill (also runs automatically at
-    startup) — useful right after changing SIGNAL_LAB_*_TAKER_FEE_PCT so
-    historical rows immediately reflect the new rate without a restart.
-    NOTE: this only fills rows where net_pnl_usdt is NULL — it will NOT
-    recompute rows that already have a net figure from a previous rate."""
+    startup) — useful right after changing SPOT_TAKER_FEE_PCT /
+    FUTURES_TAKER_FEE_PCT so historical rows immediately reflect the new
+    rate without a restart. NOTE: this only fills rows where
+    net_pnl_usdt is NULL — it will NOT recompute rows that already have
+    a net figure from a previous rate."""
     updated = await signal_lab.backfill_fees()
     return {"ok": True, "rows_updated": updated}
 

@@ -1,5 +1,5 @@
 """
-APEX-7 — Signal Lab
+APEX-8 — Signal Lab
 ════════════════════
 The "what if we'd taken this trade?" data-collection and analysis layer.
 
@@ -67,6 +67,17 @@ positions. Both are real money a live account pays. That means even
 these NET numbers remain a best case, not a true worst case — keep that
 in mind before treating a marginally-positive NET result as proven edge.
 
+FAILURE VISIBILITY
+───────────────────
+Every persistence call below (record/resolve/link) is wrapped in a
+try/except so a transient DB hiccup on one row can't crash the whole
+scan cycle — but a failure that repeats on EVERY row (e.g. a schema
+mismatch from an interrupted upgrade) needs to be LOUD, not swallowed.
+These except blocks log at WARNING (visible at the app's default INFO
+level), not DEBUG, specifically so "0 resolved after hours of runtime"
+shows up in the console the first time it happens instead of silently
+persisting until someone notices the dashboard looks wrong.
+
 This module never places, modifies, or cancels a real order. It is pure
 observation layered on top of what the consensus engine already
 computes every cycle.
@@ -83,7 +94,7 @@ from sqlalchemy import select, update
 from config import settings
 from database import AsyncSessionLocal, SignalOutcome
 
-logger = logging.getLogger("apex7.signal_lab")
+logger = logging.getLogger("apex8.signal_lab")
 
 RESOLVED_STATUSES = ("TP", "SL", "EXPIRED")
 
@@ -92,8 +103,8 @@ def _fee_pct_for(market_type: str) -> float:
     """Round-trip fee (%) — 2x the per-side taker rate, see config.py's
     fee-adjustment notes for why taker-on-both-legs is the assumption."""
     per_side = (
-        settings.SIGNAL_LAB_SPOT_TAKER_FEE_PCT if market_type == "SPOT"
-        else settings.SIGNAL_LAB_FUTURES_TAKER_FEE_PCT
+        settings.SPOT_TAKER_FEE_PCT if market_type == "SPOT"
+        else settings.FUTURES_TAKER_FEE_PCT
     )
     return per_side * 2
 
@@ -172,7 +183,7 @@ async def record_candidate(
             await session.refresh(row)
             return row.id
     except Exception as e:
-        logger.debug(f"Signal Lab record_candidate failed for {symbol}: {e}")
+        logger.warning(f"⚠ Signal Lab record_candidate failed for {symbol}: {type(e).__name__}: {e}")
         return None
 
 
@@ -191,7 +202,7 @@ async def link_trade(shadow_id: Optional[int], trade_id: Optional[int]):
             )
             await session.commit()
     except Exception as e:
-        logger.debug(f"Signal Lab link_trade failed: {e}")
+        logger.warning(f"⚠ Signal Lab link_trade failed: {type(e).__name__}: {e}")
 
 
 # ─────────────────────────────────────────────────────
@@ -222,13 +233,17 @@ async def resolve_pending(market_type: str, market_data_module, max_hold_minutes
     try:
         prices = await market_data_module.fetch_all_prices(symbols)
     except Exception as e:
-        logger.debug(f"Signal Lab price fetch failed ({market_type}): {e}")
+        logger.warning(f"⚠ Signal Lab price fetch failed ({market_type}): {type(e).__name__}: {e}")
         return
 
     now = datetime.now(timezone.utc)
     notional = settings.SIGNAL_LAB_NOTIONAL_USDT
     fee_pct_roundtrip = _fee_pct_for(market_type)
     fee_usdt = round(notional * fee_pct_roundtrip / 100, 4)
+
+    resolved_count = 0
+    failed_count = 0
+    last_error = None
 
     for r in rows:
         price = prices.get(r.symbol)
@@ -281,8 +296,22 @@ async def resolve_pending(market_type: str, market_data_module, max_hold_minutes
                     )
                 )
                 await session.commit()
+            resolved_count += 1
         except Exception as e:
-            logger.debug(f"Signal Lab resolve failed for row {r.id}: {e}")
+            failed_count += 1
+            last_error = f"{type(e).__name__}: {e}"
+
+    # A summary line rather than one log per row — this is what makes a
+    # systemic failure (every row failing the same way) visible at a
+    # glance instead of scrolling past N identical lines.
+    if failed_count:
+        logger.warning(
+            f"⚠ Signal Lab ({market_type}): {failed_count} row(s) failed to resolve "
+            f"this cycle (last error: {last_error}) — {resolved_count} succeeded. "
+            f"If this repeats every cycle, the DB schema likely doesn't match this "
+            f"code (fee_usdt/net_pnl_usdt columns) — restart the app so init_db()'s "
+            f"migration can run, or check the DB file path."
+        )
 
 
 async def backfill_fees(batch_size: int = 500) -> int:
@@ -546,10 +575,27 @@ async def status_summary(market_type: Optional[str] = None) -> dict:
     total_gross_pnl = sum(_gross(r) for r in resolved)
     total_net_pnl = sum(_net(r) for r in resolved)
 
+    # A crude staleness signal for the dashboard: if there are lots of
+    # PENDING rows that are individually older than the max hold window
+    # would allow, resolve_pending() is very likely failing silently
+    # (see the WARNING logs above) rather than everything just being
+    # "still tracking forward."
+    now = datetime.now(timezone.utc)
+    stale_pending = 0
+    for r in rows:
+        if r.status != "PENDING":
+            continue
+        created = r.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if (now - created).total_seconds() / 60 > 180:  # generous 3h catch-all
+            stale_pending += 1
+
     return {
         "enabled": settings.SIGNAL_LAB_ENABLED,
         "total_candidates": total,
         "pending": pending,
+        "stale_pending_over_3h": stale_pending,
         "resolved": len(resolved),
         "taken_as_real_trades": taken,
         "shadow_only": total - taken,

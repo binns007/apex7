@@ -1,5 +1,5 @@
 """
-APEX-7 Trading Engine
+APEX-8 Trading Engine
 ═════════════════════
 The central orchestrator. Every SCAN_INTERVAL_SECONDS it:
   1. Fetches portfolio value
@@ -28,6 +28,19 @@ Changes vs v3 (Signal Lab):
     taken this?" data accumulates for every candidate, not just the ones
     that fired. Real trades are still linked back to their shadow row
     (signal_lab.link_trade()) so the two can be cross-referenced.
+
+Changes vs v4 (real-trade fee adjustment):
+  - Closing a position now computes fee_usdt (round-trip taker fee
+    estimate on usdt_value) and net_pnl_usdt/net_pnl_pct alongside the
+    existing GROSS pnl_usdt/pnl_pct, and persists all of it.
+  - IMPORTANT BEHAVIOR CHANGE: RiskManager.on_trade_close() now receives
+    the NET pnl and a NET-based win/loss flag instead of GROSS — Kelly
+    sizing's win-rate estimate and the drawdown/heat tracking are real
+    money concepts, so they should be computed from what the account
+    actually keeps after fees, not the pre-fee price move. This means
+    the bot's own risk bookkeeping is slightly more conservative than
+    before (a trade that's a tiny gross winner but a net loser after
+    fees now correctly counts as a loss for sizing purposes).
 """
 import asyncio
 import logging
@@ -51,7 +64,7 @@ from agents import (
     ScalpingAgent, RegimeAgent,
 )
 
-logger = logging.getLogger("apex7.engine")
+logger = logging.getLogger("apex8.engine")
 
 
 class TradingEngine:
@@ -88,14 +101,14 @@ class TradingEngine:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop())
-        logger.info(f"🚀 APEX-7 Engine STARTED — mode={settings.TRADING_MODE.upper()}")
+        logger.info(f"🚀 APEX-8 Engine STARTED — mode={settings.TRADING_MODE.upper()}")
         self._log(f"Engine started in {settings.TRADING_MODE.upper()} mode")
 
     def stop(self):
         self._running = False
         if self._task:
             self._task.cancel()
-        logger.info("🛑 APEX-7 Engine STOPPED")
+        logger.info("🛑 APEX-8 Engine STOPPED")
         self._log("Engine stopped by user")
 
     @property
@@ -106,7 +119,9 @@ class TradingEngine:
         """Signal Lab hook: mutate LIVE agent instance `.weight` values
         based on measured hypothetical accuracy. Takes effect on the
         very next scan cycle — no restart needed. Returns the weights
-        actually applied (unrecognized agent names are ignored)."""
+        actually applied (unrecognized agent names are ignored). Pass a
+        single-key dict to change just ONE agent's weight in isolation
+        rather than the whole recommended batch at once."""
         applied = {}
         for agent in self.consensus.agents:
             if agent.name in weights:
@@ -154,7 +169,14 @@ class TradingEngine:
         try:
             await signal_lab.resolve_pending("SPOT", market_data, settings.SIGNAL_LAB_MAX_HOLD_MINUTES)
         except Exception as e:
-            logger.debug(f"Signal Lab resolve failed: {e}")
+            # signal_lab.resolve_pending already logs its own internal
+            # failures at WARNING; this catches anything unexpected that
+            # escapes that (e.g. a bug in resolve_pending itself) so a
+            # Signal Lab problem can never take down the trading loop —
+            # but it's still surfaced here at WARNING, not silently
+            # swallowed, since "0 resolved after hours of runtime" is
+            # exactly the kind of thing that needs to be visible.
+            logger.warning(f"⚠ Signal Lab resolve failed: {type(e).__name__}: {e}")
 
         if self.risk.halted:
             self._log(f"🛑 Trading halted: {self.risk.halt_reason}")
@@ -195,7 +217,7 @@ class TradingEngine:
                     result=result, was_taken=(result.action != "HOLD"),
                 )
             except Exception as e:
-                logger.debug(f"Signal Lab record failed {symbol}: {e}")
+                logger.warning(f"⚠ Signal Lab record failed {symbol}: {type(e).__name__}: {e}")
 
         if result.action == "HOLD":
             logger.debug(f"{symbol}: HOLD — {result.primary_reason}")
@@ -261,7 +283,7 @@ class TradingEngine:
             try:
                 await signal_lab.link_trade(shadow_id, trade_id)
             except Exception as e:
-                logger.debug(f"Signal Lab link failed {symbol}: {e}")
+                logger.warning(f"⚠ Signal Lab link failed {symbol}: {type(e).__name__}: {e}")
 
         msg = (f"✅ {result.action} {symbol} @ {price:.4f} "
                f"qty={pos.quantity:.6f} TP={pos.take_profit_price:.4f} "
@@ -304,11 +326,22 @@ class TradingEngine:
                 pnl_usdt = trade.usdt_value * pnl_pct / 100
                 label = "TP" if hit_tp else "SL"
 
-                await self._close_trade(trade, price, pnl_usdt, pnl_pct)
-                self.risk.on_trade_close(trade.symbol, pnl_usdt, hit_tp)
+                # Fee-adjusted NET figures — GROSS (pnl_usdt/pnl_pct) is
+                # the raw price move; NET subtracts a conservative
+                # round-trip taker-fee estimate (config.py) so realized
+                # PnL reflects real trading costs, not an idealized fill.
+                fee_usdt = round(trade.usdt_value * (settings.SPOT_TAKER_FEE_PCT * 2 / 100), 4)
+                net_pnl_usdt = round(pnl_usdt - fee_usdt, 4)
+                net_pnl_pct = round(net_pnl_usdt / trade.usdt_value * 100, 4) if trade.usdt_value else pnl_pct
+
+                await self._close_trade(trade, price, pnl_usdt, pnl_pct, fee_usdt, net_pnl_usdt, net_pnl_pct)
+                # Risk tracking (Kelly win-rate estimate, drawdown, heat)
+                # is now based on the NET pnl/win-flag, not gross — see
+                # this file's v4 changelog note at the top for why.
+                self.risk.on_trade_close(trade.symbol, net_pnl_usdt, net_pnl_usdt > 0)
                 self._log(
                     f"{'🎯' if hit_tp else '🔴'} {label} hit {trade.symbol} "
-                    f"PnL={pnl_pct:+.2f}% (${pnl_usdt:+.2f})"
+                    f"PnL={pnl_pct:+.2f}% (${pnl_usdt:+.2f} gross / ${net_pnl_usdt:+.2f} net)"
                 )
 
     # ─────────────────────────────────────────
@@ -328,7 +361,10 @@ class TradingEngine:
             return trade.id
 
     async def _close_trade(self, trade: Trade, exit_price: float,
-                            pnl_usdt: float, pnl_pct: float):
+                            pnl_usdt: float, pnl_pct: float,
+                            fee_usdt: Optional[float] = None,
+                            net_pnl_usdt: Optional[float] = None,
+                            net_pnl_pct: Optional[float] = None):
         async with AsyncSessionLocal() as session:
             await session.execute(
                 update(Trade)
@@ -338,6 +374,9 @@ class TradingEngine:
                     exit_price=exit_price,
                     pnl_usdt=pnl_usdt,
                     pnl_pct=pnl_pct,
+                    fee_usdt=fee_usdt,
+                    net_pnl_usdt=net_pnl_usdt,
+                    net_pnl_pct=net_pnl_pct,
                     closed_at=datetime.now(timezone.utc),
                 )
             )

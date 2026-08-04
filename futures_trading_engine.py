@@ -1,5 +1,5 @@
 """
-APEX-7 Futures Trading Engine
+APEX-8 Futures Trading Engine
 ══════════════════════════════
 Same orchestration pattern as the spot TradingEngine (fetch balance →
 check open positions → run consensus per symbol → size → execute →
@@ -32,6 +32,18 @@ Changes vs v1 (Signal Lab):
     signal_lab.resolve_pending(), using its own "FUTURES" market_type
     partition and its own (shorter) max-hold window, independent of the
     spot engine's shadow tracking.
+
+Changes vs v2 (real-trade fee adjustment):
+  - Closing a position now computes fee_usdt/net_pnl_usdt/net_pnl_pct
+    alongside the existing GROSS pnl_usdt/pnl_pct and persists all of
+    it. Futures fees are charged on NOTIONAL value traded (usdt_value),
+    not margin — leverage changes how much margin backs a position, not
+    how big a cut the exchange takes.
+  - IMPORTANT BEHAVIOR CHANGE: RiskManager.on_trade_close() now receives
+    the NET pnl and a NET-based win/loss flag instead of GROSS, same
+    reasoning as the spot engine (see trading_engine.py's v4 note) —
+    Kelly sizing and drawdown/heat tracking should reflect what the
+    account actually keeps after fees.
 """
 import asyncio
 import logging
@@ -54,7 +66,7 @@ from agents import (
     ScalpingAgent, RegimeAgent,
 )
 
-logger = logging.getLogger("apex7.futures_engine")
+logger = logging.getLogger("apex8.futures_engine")
 
 
 class FuturesTradingEngine:
@@ -134,7 +146,7 @@ class FuturesTradingEngine:
         self._running = True
         self._task = asyncio.create_task(self._loop())
         logger.info(
-            f"🚀 APEX-7 FUTURES Engine STARTED — mode={settings.TRADING_MODE.upper()} "
+            f"🚀 APEX-8 FUTURES Engine STARTED — mode={settings.TRADING_MODE.upper()} "
             f"leverage={self.leverage}x margin={self.margin_type}"
         )
         self._log(
@@ -146,7 +158,7 @@ class FuturesTradingEngine:
         self._running = False
         if self._task:
             self._task.cancel()
-        logger.info("🛑 APEX-7 FUTURES Engine STOPPED")
+        logger.info("🛑 APEX-8 FUTURES Engine STOPPED")
         self._log("Futures engine stopped by user")
 
     @property
@@ -169,7 +181,9 @@ class FuturesTradingEngine:
         """Signal Lab hook: mutate LIVE agent instance `.weight` values
         for the FUTURES engine's own agent instances (independent from
         the spot engine's instances). Takes effect on the very next scan
-        cycle — no restart needed."""
+        cycle — no restart needed. Pass a single-key dict to change just
+        ONE agent's weight in isolation rather than the whole
+        recommended batch at once."""
         applied = {}
         for agent in self.consensus.agents:
             if agent.name in weights:
@@ -210,14 +224,17 @@ class FuturesTradingEngine:
         await self._check_open_positions()
 
         # Signal Lab: resolve shadow "what if" candidates against live
-        # prices every cycle, independent of halt state (pure
-        # observation — never places/cancels a real order).
+        # prices every cycle, independent of halt state (see spot
+        # engine's identical comment for the reasoning).
         try:
             await signal_lab.resolve_pending(
                 "FUTURES", fmd, settings.FUTURES_SIGNAL_LAB_MAX_HOLD_MINUTES
             )
         except Exception as e:
-            logger.debug(f"Signal Lab resolve failed: {e}")
+            # See trading_engine.py's identical comment — resolve_pending
+            # already logs its own failures at WARNING; this is a
+            # last-resort catch for anything that escapes it.
+            logger.warning(f"⚠ Signal Lab resolve failed: {type(e).__name__}: {e}")
 
         if self.risk.halted:
             self._log(f"🛑 Trading halted: {self.risk.halt_reason}")
@@ -258,7 +275,7 @@ class FuturesTradingEngine:
                     result=result, was_taken=(result.action != "HOLD"),
                 )
             except Exception as e:
-                logger.debug(f"Signal Lab record failed {symbol}: {e}")
+                logger.warning(f"⚠ Signal Lab record failed {symbol}: {type(e).__name__}: {e}")
 
         if result.action == "HOLD":
             logger.debug(f"{symbol}: HOLD — {result.primary_reason}")
@@ -335,7 +352,7 @@ class FuturesTradingEngine:
             try:
                 await signal_lab.link_trade(shadow_id, trade_id)
             except Exception as e:
-                logger.debug(f"Signal Lab link failed {symbol}: {e}")
+                logger.warning(f"⚠ Signal Lab link failed {symbol}: {type(e).__name__}: {e}")
 
         msg = (f"✅ {result.action} {symbol} {pos.leverage}x @ {price:.4f} "
                f"qty={pos.quantity:.6f} margin=${pos.margin_usdt:.2f} "
@@ -388,11 +405,24 @@ class FuturesTradingEngine:
                 # fill is now stale — cancel it so it can't misfire later.
                 await self.executor.cancel_all_orders(trade.symbol)
 
-                await self._close_trade(trade, price, pnl_usdt, leveraged_pnl_pct, hit_liq)
-                self.risk.on_trade_close(trade.symbol, pnl_usdt, hit_tp and not hit_liq)
+                # Fee-adjusted NET figures. Futures fees are charged on
+                # NOTIONAL value traded (trade.usdt_value), not margin —
+                # leverage changes how much margin backs a position, not
+                # how big a slice of it the exchange takes a cut of.
+                fee_usdt = round((trade.usdt_value or 0.0) * (settings.FUTURES_TAKER_FEE_PCT * 2 / 100), 4)
+                net_pnl_usdt = round(pnl_usdt - fee_usdt, 4)
+                net_pnl_pct = (
+                    round(net_pnl_usdt / trade.margin_usdt * 100, 4) if trade.margin_usdt else leveraged_pnl_pct
+                )
+
+                await self._close_trade(trade, price, pnl_usdt, leveraged_pnl_pct, hit_liq,
+                                         fee_usdt, net_pnl_usdt, net_pnl_pct)
+                # Risk tracking now based on NET pnl/win-flag — see this
+                # file's v2 changelog note at the top for why.
+                self.risk.on_trade_close(trade.symbol, net_pnl_usdt, (net_pnl_usdt > 0) and not hit_liq)
                 self._log(
                     f"{'💥' if hit_liq else ('🎯' if hit_tp else '🔴')} {label} {trade.symbol} "
-                    f"PnL={leveraged_pnl_pct:+.2f}% (${pnl_usdt:+.2f})"
+                    f"PnL={leveraged_pnl_pct:+.2f}% (${pnl_usdt:+.2f} gross / ${net_pnl_usdt:+.2f} net)"
                 )
 
     # ─────────────────────────────────────────
@@ -412,7 +442,10 @@ class FuturesTradingEngine:
             return trade.id
 
     async def _close_trade(self, trade: FuturesTrade, exit_price: float,
-                            pnl_usdt: float, pnl_pct: float, was_liquidation: bool):
+                            pnl_usdt: float, pnl_pct: float, was_liquidation: bool,
+                            fee_usdt: Optional[float] = None,
+                            net_pnl_usdt: Optional[float] = None,
+                            net_pnl_pct: Optional[float] = None):
         async with AsyncSessionLocal() as session:
             await session.execute(
                 update(FuturesTrade)
@@ -422,6 +455,9 @@ class FuturesTradingEngine:
                     exit_price=exit_price,
                     pnl_usdt=pnl_usdt,
                     pnl_pct=pnl_pct,
+                    fee_usdt=fee_usdt,
+                    net_pnl_usdt=net_pnl_usdt,
+                    net_pnl_pct=net_pnl_pct,
                     closed_at=datetime.now(timezone.utc),
                 )
             )
