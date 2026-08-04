@@ -82,6 +82,7 @@ logger = logging.getLogger("apex8.futures_engine")
 
 
 class FuturesTradingEngine:
+    MARKET_TYPE = "FUTURES"
     def __init__(self):
         # A DEDICATED RegimeAgent instance running on the futures
         # timeframe stack's slowest timeframe (5m), with its own
@@ -147,6 +148,42 @@ class FuturesTradingEngine:
         # cached here purely so get_status() has something to report
         # between scans (mirrors the identical field in TradingEngine).
         self._last_balance_usdt: float = 0.0
+
+    async def close_trade_manual(self, trade_id: int) -> dict:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(FuturesTrade).where(FuturesTrade.id == trade_id))
+            trade = result.scalar_one_or_none()
+
+        if not trade:
+            return {"ok": False, "error": "Trade not found"}
+        if trade.status != "OPEN":
+            return {"ok": False, "error": f"Trade is already {trade.status}"}
+
+        await self.executor.cancel_all_orders(trade.symbol)
+
+        order = await self.executor.close_position_market(trade.symbol, trade.side, trade.quantity)
+        if not order:
+            return {"ok": False, "error": "Market close order failed — check logs / exchange"}
+
+        price = await fmd.fetch_price(trade.symbol)
+        pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
+        if trade.side == "SELL":
+            pnl_pct = -pnl_pct
+        leveraged_pct = pnl_pct * (trade.leverage or 1)
+        pnl_usdt = (trade.margin_usdt or 0.0) * leveraged_pct / 100
+        fee_usdt = round((trade.usdt_value or 0.0) * (settings.FUTURES_TAKER_FEE_PCT * 2 / 100), 4)
+        net_pnl_usdt = round(pnl_usdt - fee_usdt, 4)
+        net_pnl_pct = round(net_pnl_usdt / trade.margin_usdt * 100, 4) if trade.margin_usdt else leveraged_pct
+
+        await self._close_trade(trade, price, pnl_usdt, leveraged_pct, False, fee_usdt, net_pnl_usdt, net_pnl_pct)
+        self.risk.on_trade_close(trade.symbol, net_pnl_usdt, net_pnl_usdt > 0)
+
+        msg = (f"✋ MANUAL close {trade.symbol} @ {price:.4f} "
+            f"PnL={leveraged_pct:+.2f}% (${pnl_usdt:+.2f} gross / ${net_pnl_usdt:+.2f} net)")
+        logger.info(msg)
+        self._log(msg)
+        return {"ok": True, "trade_id": trade_id, "exit_price": price,
+                "pnl_usdt": round(pnl_usdt, 4), "net_pnl_usdt": net_pnl_usdt}
 
     # ─────────────────────────────────────────
     #  Lifecycle

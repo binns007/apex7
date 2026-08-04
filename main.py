@@ -1063,6 +1063,21 @@ async def api_signal_lab_weight_history(market_type: Optional[str] = None, limit
         for r in rows
     ]
 
+@app.post("/api/trades/{trade_id}/close")
+async def api_close_trade(trade_id: int):
+    result = await engine.close_trade_manual(trade_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Close failed"))
+    return result
+
+
+@app.post("/api/futures/trades/{trade_id}/close")
+async def api_close_futures_trade(trade_id: int):
+    result = await futures_engine.close_trade_manual(trade_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Close failed"))
+    return result
+
 
 # ═══════════════════════════════════════════════════
 #  WebSocket + Dashboard

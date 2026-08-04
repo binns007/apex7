@@ -78,6 +78,7 @@ logger = logging.getLogger("apex8.engine")
 
 
 class TradingEngine:
+    MARKET_TYPE = "SPOT"
 
     async def apply_agent_weights(
         self, weights: dict,
@@ -123,6 +124,46 @@ class TradingEngine:
             except Exception as e:
                 logger.warning(f"⚠ Failed to persist weight-change audit rows: {type(e).__name__}: {e}")
         return applied
+
+    async def close_trade_manual(self, trade_id: int) -> dict:
+        """Manually close an OPEN trade at market, right now, regardless of
+        where price sits relative to SL/TP. Cancels the existing OCO exit
+        first — Binance won't let the same locked quantity be sold twice."""
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(Trade).where(Trade.id == trade_id))
+            trade = result.scalar_one_or_none()
+
+        if not trade:
+            return {"ok": False, "error": "Trade not found"}
+        if trade.status != "OPEN":
+            return {"ok": False, "error": f"Trade is already {trade.status}"}
+
+        await self.executor.cancel_all_orders(trade.symbol)
+
+        exit_side = "SELL" if trade.side == "BUY" else "BUY"
+        order = await self.executor.place_market_order(trade.symbol, exit_side, trade.quantity)
+        if not order:
+            return {"ok": False, "error": "Market close order failed — check logs / exchange"}
+
+        price = await fetch_price(trade.symbol)
+        pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
+        if trade.side == "SELL":
+            pnl_pct = -pnl_pct
+        pnl_usdt = trade.usdt_value * pnl_pct / 100
+        fee_usdt = round(trade.usdt_value * (settings.SPOT_TAKER_FEE_PCT * 2 / 100), 4)
+        net_pnl_usdt = round(pnl_usdt - fee_usdt, 4)
+        net_pnl_pct = round(net_pnl_usdt / trade.usdt_value * 100, 4) if trade.usdt_value else pnl_pct
+
+        await self._close_trade(trade, price, pnl_usdt, pnl_pct, fee_usdt, net_pnl_usdt, net_pnl_pct)
+        self.risk.on_trade_close(trade.symbol, net_pnl_usdt, net_pnl_usdt > 0)
+
+        msg = (f"✋ MANUAL close {trade.symbol} @ {price:.4f} "
+            f"PnL={pnl_pct:+.2f}% (${pnl_usdt:+.2f} gross / ${net_pnl_usdt:+.2f} net)")
+        logger.info(msg)
+        self._log(msg)
+        return {"ok": True, "trade_id": trade_id, "exit_price": price,
+                "pnl_usdt": round(pnl_usdt, 4), "net_pnl_usdt": net_pnl_usdt}
+        
     def __init__(self):
         agents = [
             MomentumAgent(),

@@ -216,6 +216,17 @@ body.futures-mode .nav-item.active{background:rgba(255,149,0,.07)}
 .cell-lev{color:#ff9500;font-family:var(--font-mono);font-size:10px;font-weight:700}
 .cell-liq{color:#ff3b5c;font-family:var(--font-mono);font-size:10px}
 
+/* ── CLOSE BUTTON (manual position close) ── */
+.close-trade-btn{
+  padding:4px 12px;border-radius:5px;border:1px solid var(--red);
+  background:transparent;color:var(--red);cursor:pointer;
+  font-family:var(--font-mono);font-size:9px;font-weight:700;letter-spacing:.5px;
+  transition:.15s;white-space:nowrap;
+}
+.close-trade-btn:hover{background:var(--red);color:#fff}
+.close-trade-btn:disabled{opacity:.4;cursor:wait;background:transparent;color:var(--red)}
+.close-trade-dash{color:var(--muted);font-size:11px}
+
 /* ── AGENT GRID ── */
 .agent-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
 .agent-card{
@@ -555,7 +566,7 @@ body.futures-mode #weightApplyModalOverlay .leverage-modal{
               <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th>
               <th>Size</th><th>SL</th><th>TP</th><th>Risk $</th><th>Score</th>
               <th>Lev</th><th>Liq</th>
-              <th>PnL%</th><th>PnL$</th><th>Status</th>
+              <th>PnL%</th><th>PnL$</th><th>Status</th><th>Action</th>
             </tr>
           </thead>
           <tbody id="recentTrades"></tbody>
@@ -584,7 +595,7 @@ body.futures-mode #weightApplyModalOverlay .leverage-modal{
               <th>USDT</th><th>SL</th><th>TP</th><th>Risk $</th><th>Score</th>
               <th>Lev</th><th>Liq</th>
               <th>PnL%</th><th>PnL$</th><th>Regime</th>
-              <th>Agents</th><th>Status</th><th>Opened</th>
+              <th>Agents</th><th>Status</th><th>Opened</th><th>Action</th>
             </tr>
           </thead>
           <tbody id="allTrades"></tbody>
@@ -923,6 +934,7 @@ let currentMarket = 'spot';                 // 'spot' | 'futures'
 let spotStatus = {}, futuresStatus = {};
 let spotPrices = {}, futuresPrices = {};
 let chartData=[], equityData=[];
+let closingTradeIds = new Set();             // trade ids with a close request in flight (disables the button)
 
 // ── Active-market accessors — every render function below reads
 //    through these instead of touching spotStatus/futuresStatus
@@ -1036,6 +1048,44 @@ async function confirmFuturesStart(){
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({leverage:lev, margin_type:mt})
+  });
+}
+
+// ── Manual close-trade ──────────────────
+// apiBase() already resolves to /api or /api/futures for the active
+// market, so this single handler works for both trade tables — the
+// backend route is POST {apiBase()}/trades/{id}/close either way.
+async function closeTrade(id){
+  if(closingTradeIds.has(id))return;   // already in flight, ignore double-click
+  if(!confirm('Close this position at market right now? This cancels the existing SL/TP order(s) first.'))return;
+
+  closingTradeIds.add(id);
+  renderCloseButtons();
+
+  try{
+    const res = await fetch(`${apiBase()}/trades/${id}/close`,{method:'POST'});
+    const data = await res.json().catch(()=>({}));
+    if(!res.ok){
+      alert(`Close failed: ${data.detail || res.statusText || 'unknown error'}`);
+      return;
+    }
+    const pnl = data.net_pnl_usdt;
+    const pnlTxt = pnl!=null ? `${pnl>=0?'+':''}$${pnl.toFixed(2)} net` : 'closed';
+    alert(`Position closed @ ${data.exit_price?.toFixed?.(4) ?? data.exit_price} — ${pnlTxt}`);
+  } catch(e){
+    alert(`Close failed: ${e.message||e}`);
+  } finally{
+    closingTradeIds.delete(id);
+    loadTrades('');
+  }
+}
+// Disables/re-enables just the close buttons currently on screen while
+// a request is in flight, without a full table re-render/re-fetch.
+function renderCloseButtons(){
+  document.querySelectorAll('[data-close-id]').forEach(btn=>{
+    const id = parseInt(btn.dataset.closeId);
+    btn.disabled = closingTradeIds.has(id);
+    btn.textContent = closingTradeIds.has(id) ? 'CLOSING…' : 'CLOSE';
   });
 }
 
@@ -1282,6 +1332,8 @@ drawDial(0);
 // Renders full trade rows including SL / TP / Risk $ / Score / Leverage /
 // Liquidation, and — for OPEN trades — live unrealized PnL. LEV/LIQ show
 // "—" for spot trades (those fields simply aren't present on that API).
+// The last cell is the manual Close action — only rendered for OPEN
+// trades, wired to closeTrade(id) which POSTs {apiBase()}/trades/{id}/close.
 function tradeRow(t, forRecent){
   const isOpen = t.status === 'OPEN';
   const pnl = isOpen ? t.unrealized_pnl_usdt : t.pnl_usdt;
@@ -1295,6 +1347,11 @@ function tradeRow(t, forRecent){
   const levTxt = t.leverage!=null ? `${t.leverage}×` : '—';
   const liqTxt = t.liquidation_price!=null ? t.liquidation_price.toFixed(4) : '—';
   const statusClass = t.status==='LIQUIDATED' ? 'badge-liquidated' : `badge-${t.status.toLowerCase()}`;
+
+  const isClosing = closingTradeIds.has(t.id);
+  const closeCell = isOpen
+    ? `<button class="close-trade-btn" data-close-id="${t.id}" onclick="closeTrade(${t.id})" ${isClosing?'disabled':''}>${isClosing?'CLOSING…':'CLOSE'}</button>`
+    : `<span class="close-trade-dash">—</span>`;
 
   const commonCells = `
       <td style="font-family:var(--font-mono);font-size:11px">${t.symbol}</td>
@@ -1314,6 +1371,7 @@ function tradeRow(t, forRecent){
   if (forRecent) {
     return `<tr>${commonCells}
       <td><span class="badge ${statusClass}">${t.status}</span></td>
+      <td>${closeCell}</td>
     </tr>`;
   }
 
@@ -1323,6 +1381,7 @@ function tradeRow(t, forRecent){
       <td style="font-family:var(--font-mono);font-size:10px">${agreeTxt}</td>
       <td><span class="badge ${statusClass}">${t.status}</span></td>
       <td style="font-size:10px;color:var(--muted)">${t.opened_at?new Date(t.opened_at).toLocaleTimeString():'—'}</td>
+      <td>${closeCell}</td>
     </tr>`;
 }
 
@@ -1333,13 +1392,13 @@ async function loadTrades(statusFilter){
   const allBody=document.getElementById('allTrades');
   if(allBody){
     allBody.innerHTML = trades.map(t=>tradeRow(t,false)).join('') ||
-      '<tr><td colspan="17" style="text-align:center;padding:24px;color:var(--muted)">No trades yet</td></tr>';
+      '<tr><td colspan="18" style="text-align:center;padding:24px;color:var(--muted)">No trades yet</td></tr>';
   }
 
   const recentBody=document.getElementById('recentTrades');
   if(recentBody){
     recentBody.innerHTML = trades.slice(0,8).map(t=>tradeRow(t,true)).join('') ||
-      '<tr><td colspan="14" style="text-align:center;padding:16px;color:var(--muted)">No trades yet</td></tr>';
+      '<tr><td colspan="15" style="text-align:center;padding:16px;color:var(--muted)">No trades yet</td></tr>';
   }
 }
 

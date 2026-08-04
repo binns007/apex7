@@ -117,8 +117,8 @@ class Settings:
     # v1 defaults (0.68 / 5-of-8) combined with a hard regime block and a
     # hard temporal-confluence requirement meant the bot rarely fired.
     # These defaults are still conservative but no longer triple-gated.
-    MIN_CONSENSUS_SCORE: float = _env_float("MIN_CONSENSUS_SCORE", 0.60)
-    MIN_AGENTS_AGREE: int = _env_int("MIN_AGENTS_AGREE", 4)
+    MIN_CONSENSUS_SCORE: float = _env_float("MIN_CONSENSUS_SCORE", 0.55)
+    MIN_AGENTS_AGREE: int = _env_int("MIN_AGENTS_AGREE", 3)
     SCALPING_ENABLED: bool = _env_bool("SCALPING_ENABLED", True)
     SENTIMENT_ENABLED: bool = _env_bool("SENTIMENT_ENABLED", True)
 
@@ -147,7 +147,7 @@ class Settings:
     PRIMARY_TIMEFRAME: str = "5m"
 
     # ── Agent scan cycle — SPOT ────────────────────────
-    SCAN_INTERVAL_SECONDS: int = _env_int("SCAN_INTERVAL_SECONDS", 30)
+    SCAN_INTERVAL_SECONDS: int = _env_int("SCAN_INTERVAL_SECONDS", 15)
 
     # ── Candle history depth per timeframe ────────────
     CANDLE_LIMIT: int = _env_int("CANDLE_LIMIT", 200)
@@ -219,8 +219,8 @@ class Settings:
     FUTURES_CANDLE_LIMIT: int = _env_int("FUTURES_CANDLE_LIMIT", 200)
 
     # ── Strategy thresholds — FUTURES ─────────────────
-    FUTURES_MIN_CONSENSUS_SCORE: float = _env_float("FUTURES_MIN_CONSENSUS_SCORE", 0.58)
-    FUTURES_MIN_AGENTS_AGREE: int = _env_int("FUTURES_MIN_AGENTS_AGREE", 4)
+    FUTURES_MIN_CONSENSUS_SCORE: float = _env_float("FUTURES_MIN_CONSENSUS_SCORE", 0.52)
+    FUTURES_MIN_AGENTS_AGREE: int = _env_int("FUTURES_MIN_AGENTS_AGREE", 3)
     FUTURES_TIE_BREAK_ACTION: str = os.getenv("FUTURES_TIE_BREAK_ACTION", "HOLD")
 
     # ── Temporal confluence — FUTURES ─────────────────
