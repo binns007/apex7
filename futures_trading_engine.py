@@ -44,6 +44,18 @@ Changes vs v2 (real-trade fee adjustment):
     reasoning as the spot engine (see trading_engine.py's v4 note) —
     Kelly sizing and drawdown/heat tracking should reflect what the
     account actually keeps after fees.
+
+Changes vs v3 (balance display fix):
+  - get_status() previously fetched portfolio_usdt every scan cycle
+    (via executor.get_usdt_balance()) but only ever used it to feed the
+    risk manager / position sizing — it was never surfaced in the dict
+    returned by get_status(), so the dashboard's "Futures Margin
+    Balance" stat card had nothing to read and always showed "—". The
+    scan loop now caches the last-fetched balance on
+    `_last_balance_usdt`, and get_status() includes it as
+    `balance_usdt` so the WebSocket status payload carries it to the
+    frontend on every tick — mirrors the identical fix in
+    trading_engine.py.
 """
 import asyncio
 import logging
@@ -65,7 +77,7 @@ from agents import (
     VolumeAgent, SentimentAgent, OrderBookAgent,
     ScalpingAgent, RegimeAgent,
 )
-
+from database import AsyncSessionLocal, FuturesTrade, FuturesAgentSignal, FuturesPerformanceSnapshot, AgentWeightHistory
 logger = logging.getLogger("apex8.futures_engine")
 
 
@@ -131,6 +143,10 @@ class FuturesTradingEngine:
         self._scan_count = 0
         self._last_scan: Optional[datetime] = None
         self._status_log: list[str] = []
+        # Last futures margin balance fetched during a scan cycle —
+        # cached here purely so get_status() has something to report
+        # between scans (mirrors the identical field in TradingEngine).
+        self._last_balance_usdt: float = 0.0
 
     # ─────────────────────────────────────────
     #  Lifecycle
@@ -177,26 +193,54 @@ class FuturesTradingEngine:
             self.margin_type = margin_type
             self._log(f"Margin type updated to {self.margin_type} (applies to new entries)")
 
-    def apply_agent_weights(self, weights: dict) -> dict:
-        """Signal Lab hook: mutate LIVE agent instance `.weight` values
-        for the FUTURES engine's own agent instances (independent from
-        the spot engine's instances). Takes effect on the very next scan
-        cycle — no restart needed. Pass a single-key dict to change just
-        ONE agent's weight in isolation rather than the whole
-        recommended batch at once."""
-        applied = {}
-        for agent in self.consensus.agents:
-            if agent.name in weights:
+    async def apply_agent_weights(
+            self, weights: dict,
+            samples_map: Optional[dict] = None,
+            win_rate_map: Optional[dict] = None,
+        ) -> dict:
+            """Signal Lab hook: mutate LIVE agent instance `.weight` values
+            for the FUTURES engine's own agent instances (independent from
+            the spot engine's instances), and persist an audit row per
+            change to AgentWeightHistory. Takes effect on the very next scan
+            cycle — no restart needed. `type(agent).weight` (the pristine
+            class-level default) is captured as `baseline_weight` — this
+            never changes no matter how many times weights are applied,
+            since `agent.weight = new_w` sets an INSTANCE attribute that
+            shadows the class attribute rather than mutating it. Pass a
+            subset of `weights` to change only specific agents rather than
+            the whole recommended batch at once."""
+            applied = {}
+            history_rows = []
+            for agent in self.consensus.agents:
+                if agent.name not in weights:
+                    continue
                 try:
                     new_w = float(weights[agent.name])
                 except (TypeError, ValueError):
                     continue
+                old_w = agent.weight
+                baseline_w = type(agent).weight
                 agent.weight = new_w
                 applied[agent.name] = new_w
-        if applied:
-            logger.info(f"⚙ Signal Lab applied futures agent weights: {applied}")
-            self._log(f"⚙ Signal Lab applied agent weights: {applied}")
-        return applied
+                history_rows.append(AgentWeightHistory(
+                    market_type=self.MARKET_TYPE,
+                    agent_name=agent.name,
+                    baseline_weight=baseline_w,
+                    old_weight=old_w,
+                    new_weight=new_w,
+                    samples=(samples_map or {}).get(agent.name),
+                    win_rate_when_agreed_pct=(win_rate_map or {}).get(agent.name),
+                ))
+            if applied:
+                logger.info(f"⚙ Signal Lab applied futures agent weights: {applied}")
+                self._log(f"⚙ Signal Lab applied agent weights: {applied}")
+                try:
+                    async with AsyncSessionLocal() as session:
+                        session.add_all(history_rows)
+                        await session.commit()
+                except Exception as e:
+                    logger.warning(f"⚠ Failed to persist weight-change audit rows: {type(e).__name__}: {e}")
+            return applied
 
     # ─────────────────────────────────────────
     #  Main loop
@@ -220,6 +264,7 @@ class FuturesTradingEngine:
 
         portfolio_usdt = await self.executor.get_usdt_balance()
         self.risk.update_portfolio_value(portfolio_usdt)
+        self._last_balance_usdt = portfolio_usdt
 
         await self._check_open_positions()
 
@@ -513,6 +558,7 @@ class FuturesTradingEngine:
             "margin_type": self.margin_type,
             "scan_count": self._scan_count,
             "last_scan": self._last_scan.isoformat() if self._last_scan else None,
+            "balance_usdt": self._last_balance_usdt,
             "risk": self.risk.summary(),
             "pairs": settings.FUTURES_TRADING_PAIRS,
             "log": list(reversed(self._status_log[-50:])),

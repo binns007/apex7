@@ -509,50 +509,58 @@ async def agents_agree_bucket_performance(
 async def recommend_weights(
     market_type: str,
     min_samples: Optional[int] = None,
-    base_weights: Optional[dict] = None,
+    baseline_weights: Optional[dict] = None,
+    current_weights: Optional[dict] = None,
 ) -> list[dict]:
-    """A simple, transparent re-weighting rule, NOT a black box: each
-    agent's live weight is nudged toward its measured hypothetical
-    accuracy (NET win rate when it agreed with the eventual candidate
-    direction), bounded to ±50% per pass so one noisy batch of data
-    can't swing the engine to an extreme. Intended to be re-run
-    periodically (e.g. weekly) as more resolved history accumulates —
-    each pass compounds gently rather than leaping straight to whatever
-    the current sample suggests.
+    """A simple, transparent re-weighting rule: each agent's suggested
+    weight is nudged from its ORIGINAL, PRISTINE baseline weight (the
+    class-level default defined in agents/*.py, e.g. MomentumAgent's
+    1.3), bounded to ±50% of that baseline — NEVER from whatever the
+    live weight currently happens to be.
+
+    This is the key correctness fix vs the earlier version: computing
+    the ±50% band from the *current* (possibly already-adjusted) weight
+    let repeated Apply clicks compound drift indefinitely — click twice
+    and you could get up to 2.25x baseline, click five times and there
+    was no ceiling at all relative to where the agent started. Anchoring
+    to `baseline_weights` (the untouched class default) instead makes
+    every recommendation idempotent given the same underlying data: applying
+    it once, or applying it fifty times in a row with no new resolved
+    outcomes in between, produces the exact same suggested_weight. Drift
+    can only happen because the underlying win-rate data genuinely
+    changed, never because of how many times someone clicked Apply.
 
         multiplier = 1.0 + (win_rate - 0.50) * 2.5   clamped to [0.5, 1.5]
+        suggested_weight = baseline_weight * multiplier
 
-    50% win rate → 1.00x (no change). 60% → 1.25x. 70% → 1.50x (capped).
-    40% → 0.75x. 30% → 0.50x (capped). This mirrors, at a much simpler
-    level, the same idea as the engine's built-in rolling accuracy
-    multiplier (_accuracy_multiplier in consensus_engine.py) but is
-    explicit, inspectable, and only applied when YOU choose to apply it.
-
-    Uses NET (fee-adjusted) win rate, since a weight recommendation
-    based on GROSS numbers could recommend increasing an agent's
-    influence based on "wins" that wouldn't survive real trading costs.
+    `current_weights` is reported alongside purely for display /
+    diffing in the UI — it never feeds into the calculation.
     """
     min_samples = settings.SIGNAL_LAB_MIN_SAMPLES if min_samples is None else min_samples
     perf = await agent_performance(market_type=market_type, min_samples=min_samples)
-    base_weights = base_weights or {}
+    baseline_weights = baseline_weights or {}
+    current_weights = current_weights or baseline_weights
 
     recs = []
     for p in perf:
         name = p["agent"]
-        base = base_weights.get(name, 1.0)
+        baseline = baseline_weights.get(name, 1.0)
+        current = current_weights.get(name, baseline)
         win_rate = p["win_rate_when_agreed_pct"] / 100
         multiplier = 1.0 + (win_rate - 0.50) * 2.5
         multiplier = max(0.5, min(1.5, multiplier))
-        new_weight = round(base * multiplier, 3)
+        new_weight = round(baseline * multiplier, 3)
         recs.append({
             "agent": name,
-            "current_weight": round(base, 3),
+            "baseline_weight": round(baseline, 3),
+            "current_weight": round(current, 3),
             "samples": p["samples_when_agreed"],
             "win_rate_when_agreed_pct": p["win_rate_when_agreed_pct"],
             "avg_pnl_usdt_when_agreed": p["avg_pnl_usdt_when_agreed"],
             "suggested_weight": new_weight,
+            "delta_vs_current": round(new_weight - current, 3),
         })
-    recs.sort(key=lambda x: x["suggested_weight"] - x["current_weight"], reverse=True)
+    recs.sort(key=lambda x: abs(x["delta_vs_current"]), reverse=True)
     return recs
 
 

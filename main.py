@@ -67,6 +67,19 @@ Changes vs v6 (real-trade fee adjustment):
   - lifespan() now also runs a one-time backfill for historical CLOSED
     real trades that predate this feature (mirrors Signal Lab's own
     backfill_fees(), but for Trade/FuturesTrade instead of SignalOutcome).
+
+Changes vs v7 (resilient startup backfill):
+  - database.py's init_db() now self-heals ANY missing column on ANY
+    known table on every boot (see that file's v7 changelog) — the
+    `no such column: trades.risk_usdt` class of error that used to hit
+    a persisted DB (e.g. a Railway Volume created before a schema
+    change) should no longer happen. _backfill_trade_fees() is
+    defense-in-depth on top of that: the spot-Trade block and the
+    FuturesTrade block are now each wrapped independently, so a problem
+    on ONE table (schema drift, a locked DB file, anything) can't
+    silently prevent the OTHER table's historical rows from being
+    backfilled, and both failures are logged individually instead of
+    one exception aborting the whole function.
 """
 import asyncio
 import json
@@ -91,6 +104,12 @@ import futures_market_data as fmd
 from trading_engine import engine
 from futures_trading_engine import futures_engine
 import signal_lab
+from database import (
+    init_db, AsyncSessionLocal, Trade, AgentSignal, PerformanceSnapshot,
+    FuturesTrade, FuturesAgentSignal, FuturesPerformanceSnapshot,
+    SignalOutcome, AgentWeightHistory,
+)
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -126,14 +145,13 @@ class ConnectionManager:
 ws_manager = ConnectionManager()
 
 
-async def _backfill_trade_fees() -> int:
-    """One-time-per-row (safe on every startup — only touches rows still
-    missing net_pnl_usdt) retroactive fee/net-PnL computation for REAL
-    trades that closed BEFORE this feature existed. Mirrors
-    signal_lab.backfill_fees(), but for Trade/FuturesTrade instead of
-    the shadow SignalOutcome table."""
+async def _backfill_spot_trade_fees() -> int:
+    """Backfill fee/net-PnL for historical CLOSED spot trades. Isolated
+    from the futures backfill below so a failure here (e.g. schema
+    drift, a locked DB file) can't prevent futures trades from being
+    backfilled too — each table's problem is now visible on its own
+    instead of one exception hiding the other."""
     updated = 0
-
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Trade).where(Trade.status == "CLOSED", Trade.net_pnl_usdt.is_(None))
@@ -147,7 +165,14 @@ async def _backfill_trade_fees() -> int:
             updated += 1
         if rows:
             await session.commit()
+    return updated
 
+
+async def _backfill_futures_trade_fees() -> int:
+    """Backfill fee/net-PnL for historical CLOSED/LIQUIDATED futures
+    trades. See _backfill_spot_trade_fees() docstring for why this is
+    split out rather than sharing one try/except with the spot table."""
+    updated = 0
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(FuturesTrade).where(
@@ -167,8 +192,42 @@ async def _backfill_trade_fees() -> int:
             updated += 1
         if rows:
             await session.commit()
-
     return updated
+
+
+async def _backfill_trade_fees() -> int:
+    """One-time-per-row (safe on every startup — only touches rows still
+    missing net_pnl_usdt) retroactive fee/net-PnL computation for REAL
+    trades that closed BEFORE this feature existed. Mirrors
+    signal_lab.backfill_fees(), but for Trade/FuturesTrade instead of
+    the shadow SignalOutcome table.
+
+    v7: spot and futures are now backfilled independently (see the two
+    helpers above) so a problem in one table doesn't take down the
+    other, and each failure is logged with which table it was."""
+    total_updated = 0
+
+    try:
+        spot_updated = await _backfill_spot_trade_fees()
+        total_updated += spot_updated
+    except Exception as e:
+        logger.warning(
+            f"⚠ Spot trade fee backfill failed: {type(e).__name__}: {e} — "
+            f"if this mentions 'no such column', a schema migration didn't "
+            f"complete; check the '✅ Migrated' / '❌ Schema sync failed' "
+            f"log lines from database.init_db() just above this."
+        )
+
+    try:
+        futures_updated = await _backfill_futures_trade_fees()
+        total_updated += futures_updated
+    except Exception as e:
+        logger.warning(
+            f"⚠ Futures trade fee backfill failed: {type(e).__name__}: {e} — "
+            f"see database.init_db()'s migration log lines above for details."
+        )
+
+    return total_updated
 
 
 @asynccontextmanager
@@ -183,12 +242,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠ Signal Lab fee backfill failed: {e}")
 
-    try:
-        trades_backfilled = await _backfill_trade_fees()
-        if trades_backfilled:
-            logger.info(f"✅ Backfilled fee adjustment on {trades_backfilled} historical closed real trades")
-    except Exception as e:
-        logger.warning(f"⚠ Real trade fee backfill failed: {e}")
+    trades_backfilled = await _backfill_trade_fees()
+    if trades_backfilled:
+        logger.info(f"✅ Backfilled fee adjustment on {trades_backfilled} historical closed real trades")
 
     problems = settings.validate()
     if problems:
@@ -203,7 +259,7 @@ async def lifespan(app: FastAPI):
     await fmd.shutdown()
 
 
-app = FastAPI(title="APEX-8 Trading Bot", version="6.0.0", lifespan=lifespan)
+app = FastAPI(title="APEX-8 Trading Bot", version="7.0.0", lifespan=lifespan)
 
 
 async def _ws_broadcaster():
@@ -930,12 +986,82 @@ class ApplyWeightsBody(BaseModel):
     weights: dict[str, float]
 
 
+@app.get("/api/signal-lab/weight-recommendations")
+async def api_signal_lab_weight_recommendations(market_type: Optional[str] = None, min_samples: Optional[int] = None):
+    mt = _market_type_param(market_type) or "SPOT"
+    eng = futures_engine if mt == "FUTURES" else engine
+    # baseline = pristine class-default weight (never mutated), current =
+    # whatever's live right now. Passing BOTH lets the UI show the diff
+    # honestly without the recommendation itself depending on current.
+    baseline_weights = {a.name: type(a).weight for a in eng.consensus.agents}
+    current_weights = {a.name: a.weight for a in eng.consensus.agents}
+    return await signal_lab.recommend_weights(mt, min_samples, baseline_weights, current_weights)
+
+
+class ApplyWeightsBody(BaseModel):
+    market_type: str
+    agents: Optional[list[str]] = None   # None/empty = apply ALL current recommendations
+    min_samples: Optional[int] = None
+
+
 @app.post("/api/signal-lab/apply-weights")
 async def api_signal_lab_apply_weights(body: ApplyWeightsBody):
     mt = _market_type_param(body.market_type) or "SPOT"
     eng = futures_engine if mt == "FUTURES" else engine
-    applied = eng.apply_agent_weights(body.weights)
+
+    # Recompute recommendations FRESH here rather than trusting whatever
+    # weight values the client posts. This closes two problems at once:
+    #   1. staleness — the client's cached recommendation could be from
+    #      a page load several minutes/market-switches ago
+    #   2. tampering/bugs — a client could otherwise submit an arbitrary
+    #      {agent: weight} dict with no server-side sanity check at all
+    # The client only ever tells us WHICH agent names it wants applied;
+    # the actual numbers always come from a fresh server-side calculation
+    # anchored to each agent's pristine baseline weight.
+    baseline_weights = {a.name: type(a).weight for a in eng.consensus.agents}
+    recs = await signal_lab.recommend_weights(mt, body.min_samples, baseline_weights)
+
+    if not recs:
+        raise HTTPException(
+            status_code=400,
+            detail="No weight recommendations available yet — not enough resolved Signal Lab data.",
+        )
+
+    selected = set(body.agents) if body.agents else None
+    weights_to_apply, samples_map, win_rate_map = {}, {}, {}
+    for r in recs:
+        if selected is not None and r["agent"] not in selected:
+            continue
+        weights_to_apply[r["agent"]] = r["suggested_weight"]
+        samples_map[r["agent"]] = r["samples"]
+        win_rate_map[r["agent"]] = r["win_rate_when_agreed_pct"]
+
+    if not weights_to_apply:
+        raise HTTPException(status_code=400, detail="No matching agents to apply weights to.")
+
+    applied = await eng.apply_agent_weights(weights_to_apply, samples_map, win_rate_map)
     return {"ok": True, "market_type": mt, "applied_weights": applied}
+
+
+@app.get("/api/signal-lab/weight-history")
+async def api_signal_lab_weight_history(market_type: Optional[str] = None, limit: int = 100):
+    mt = _market_type_param(market_type)
+    async with AsyncSessionLocal() as session:
+        q = select(AgentWeightHistory).order_by(desc(AgentWeightHistory.applied_at)).limit(limit)
+        if mt:
+            q = q.where(AgentWeightHistory.market_type == mt)
+        result = await session.execute(q)
+        rows = result.scalars().all()
+    return [
+        {
+            "id": r.id, "market_type": r.market_type, "agent_name": r.agent_name,
+            "baseline_weight": r.baseline_weight, "old_weight": r.old_weight,
+            "new_weight": r.new_weight, "samples": r.samples,
+            "win_rate_when_agreed_pct": r.win_rate_when_agreed_pct,
+            "applied_at": r.applied_at.isoformat() if r.applied_at else None,
+        }
+        for r in rows
+    ]
 
 
 # ═══════════════════════════════════════════════════

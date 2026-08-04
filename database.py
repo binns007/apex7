@@ -44,13 +44,31 @@ Changes vs v6 (real-trade fee adjustment):
     well, so "Realized PnL" on the dashboard reflects actual trading
     costs. `pnl_usdt` / `pnl_pct` are unchanged in meaning (GROSS, raw
     price move) — the new columns are the NET (post-fee) figures.
-  - Because these are new columns on tables that may already have real
-    trade history in them (not a fresh install), `init_db()` runs a
-    small idempotent SQLite migration (ALTER TABLE ADD COLUMN) after
-    create_all() for every table that might need it — SQLAlchemy's
-    create_all() only creates missing TABLES, it never alters columns
-    on a table that already exists.
+
+Changes vs v7 (self-healing schema migration):
+  - PROBLEM THIS FIXES: on any deployment where data/apex7.db persists
+    across code updates (e.g. a Railway Volume), Base.metadata.create_all()
+    is a no-op for tables that already exist — it NEVER alters columns on
+    an existing table. Every schema change above therefore needed someone
+    to remember to also add an entry to a hand-maintained
+    `_add_missing_columns(conn, "trades", {...})` call. That list drifted:
+    `risk_usdt` (added in v2) was never added to it, only the v6 fee
+    columns were. Result: a persisted DB created before v2 would run this
+    app for months, then suddenly throw
+    `sqlite3.OperationalError: no such column: trades.risk_usdt` the
+    moment ANY query touched the Trade model — including plain
+    `/api/trades` reads, not just the fee backfill — because SQLAlchemy's
+    `select(Trade)` selects every mapped column by default, not just the
+    ones a given query happens to need.
+  - FIX: `_sync_table_columns()` replaces the curated dict entirely. It
+    diffs each ORM model's declared columns against `PRAGMA table_info`
+    on the real table and ALTERs in whatever is missing, for every table
+    APEX-8 defines. This is generic — the next time a column gets added
+    to Trade/FuturesTrade/SignalOutcome/etc., it self-heals on the next
+    startup with zero additional migration code required. Safe to run on
+    every boot; it only ever adds columns, never touches existing data.
 """
+import logging
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -61,6 +79,8 @@ DATABASE_URL = "sqlite+aiosqlite:///./data/apex7.db"
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+logger = logging.getLogger("apex8.db")
 
 
 class Base(DeclarativeBase):
@@ -196,6 +216,30 @@ class FuturesAgentSignal(Base):
     )
 
 
+
+class AgentWeightHistory(Base):
+    """Audit trail for every Signal Lab weight change actually applied to
+    a live engine. Without this there was no record of when a weight
+    changed or what it changed from/to — impossible to correlate a later
+    performance shift with a specific weight adjustment."""
+    __tablename__ = "agent_weight_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    market_type: Mapped[str] = mapped_column(String(10))     # SPOT | FUTURES
+    agent_name: Mapped[str] = mapped_column(String(50))
+    baseline_weight: Mapped[float] = mapped_column(Float)    # pristine class-default — the fixed anchor
+    old_weight: Mapped[float] = mapped_column(Float)         # live weight immediately before this change
+    new_weight: Mapped[float] = mapped_column(Float)         # weight actually applied
+    samples: Mapped[int] = mapped_column(Integer, nullable=True)
+    win_rate_when_agreed_pct: Mapped[float] = mapped_column(Float, nullable=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index("ix_weight_history_market_type", "market_type"),
+        Index("ix_weight_history_agent_name", "agent_name"),
+        Index("ix_weight_history_applied_at", "applied_at"),
+    )
+
 class FuturesPerformanceSnapshot(Base):
     __tablename__ = "futures_performance_snapshots"
 
@@ -271,38 +315,63 @@ class SignalOutcome(Base):
     )
 
 
-async def _add_missing_columns(conn, table_name: str, columns: dict[str, str]):
-    """Idempotent SQLite migration: add any columns in `columns` (name ->
-    SQL type) that don't already exist on `table_name`. Safe to call on
-    every startup — Base.metadata.create_all() only creates tables that
-    are missing ENTIRELY, it does nothing to a table that already exists
-    with an older column set, so without this a person upgrading with
-    real history already in their DB would hit
-    sqlite3.OperationalError: no such column the first time the app
-    tried to write one of the new fee/net columns."""
-    result = await conn.execute(text(f"PRAGMA table_info({table_name})"))
+# All ORM models that init_db() should keep schema-synced. Add any new
+# model to this tuple and it's automatically covered by the generic
+# migration below — no more hand-maintained column dicts to forget.
+_ALL_MODELS = (
+    Trade, AgentSignal, PerformanceSnapshot,
+    FuturesTrade, FuturesAgentSignal, FuturesPerformanceSnapshot,
+    SignalOutcome,
+)
+
+
+async def _sync_table_columns(conn, model) -> list[str]:
+    """Self-healing migration: for the given ORM model, ALTER TABLE ADD
+    COLUMN any column that's declared on the model but missing from the
+    actual SQLite table. Generic replacement for a hand-maintained
+    per-column dict — every future model change (new column on Trade,
+    FuturesTrade, SignalOutcome, etc.) now self-heals on the next startup
+    instead of silently drifting until someone hits
+    `sqlite3.OperationalError: no such column: ...` in production (which
+    is exactly how `risk_usdt` got missed here — it predates the fee
+    columns and was never added to the old curated migration list).
+
+    Safe to run on every boot: only ADDs columns, never drops or alters
+    existing ones, and is a no-op once a table is fully in sync.
+    """
+    table = model.__table__
+    result = await conn.execute(text(f"PRAGMA table_info({table.name})"))
     existing_cols = {row[1] for row in result.fetchall()}  # row[1] = column name
-    for col_name, col_type in columns.items():
-        if col_name not in existing_cols:
-            await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"))
+
+    added = []
+    for col in table.columns:
+        if col.name in existing_cols:
+            continue
+        col_type = col.type.compile(dialect=conn.dialect)
+        await conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN "{col.name}" {col_type}'))
+        added.append(col.name)
+    return added
 
 
 async def init_db():
-    """Create all tables (spot + futures + signal lab), then run any
-    small column migrations needed on tables that already existed."""
+    """Create all tables (spot + futures + signal lab), then self-heal
+    any column drift on tables that already existed from an older
+    version of the schema (see _sync_table_columns docstring)."""
     import os
     os.makedirs("data", exist_ok=True)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        await _add_missing_columns(conn, "signal_outcomes", {
-            "fee_usdt": "FLOAT", "net_pnl_usdt": "FLOAT",
-        })
-        await _add_missing_columns(conn, "trades", {
-            "fee_usdt": "FLOAT", "net_pnl_usdt": "FLOAT", "net_pnl_pct": "FLOAT",
-        })
-        await _add_missing_columns(conn, "futures_trades", {
-            "fee_usdt": "FLOAT", "net_pnl_usdt": "FLOAT", "net_pnl_pct": "FLOAT",
-        })
+        for model in _ALL_MODELS:
+            try:
+                added = await _sync_table_columns(conn, model)
+                if added:
+                    logger.info(f"✅ Migrated '{model.__tablename__}': added columns {added}")
+            except Exception as e:
+                # A migration failure on one table should be loud (schema
+                # drift left half-fixed is worse than not fixed at all if
+                # it's silent) but must not prevent the other tables from
+                # being checked/migrated.
+                logger.error(f"❌ Schema sync failed for '{model.__tablename__}': {type(e).__name__}: {e}")
 
 
 async def get_session() -> AsyncSession:

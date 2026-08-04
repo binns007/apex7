@@ -41,6 +41,16 @@ Changes vs v4 (real-trade fee adjustment):
     the bot's own risk bookkeeping is slightly more conservative than
     before (a trade that's a tiny gross winner but a net loser after
     fees now correctly counts as a loss for sizing purposes).
+
+Changes vs v5 (balance display fix):
+  - get_status() previously fetched portfolio_usdt every scan cycle
+    (via executor.get_usdt_balance()) but only ever used it to feed
+    the risk manager / position sizing — it was never surfaced in the
+    dict returned by get_status(), so the dashboard's "Portfolio USDT"
+    stat card had nothing to read and always showed "—". The scan loop
+    now caches the last-fetched balance on `_last_balance_usdt`, and
+    get_status() includes it as `balance_usdt` so the WebSocket status
+    payload carries it to the frontend on every tick.
 """
 import asyncio
 import logging
@@ -68,6 +78,51 @@ logger = logging.getLogger("apex8.engine")
 
 
 class TradingEngine:
+
+    async def apply_agent_weights(
+        self, weights: dict,
+        samples_map: Optional[dict] = None,
+        win_rate_map: Optional[dict] = None,
+    ) -> dict:
+        """Mutate LIVE agent instance `.weight` values and persist an
+        audit row per change. Takes effect on the very next scan cycle.
+        `type(agent).weight` (the pristine class-level default) is
+        captured as `baseline_weight` for the audit row — this NEVER
+        changes no matter how many times weights are applied, since
+        `agent.weight = new_w` sets an INSTANCE attribute that shadows
+        the class attribute rather than mutating it."""
+        applied = {}
+        history_rows = []
+        for agent in self.consensus.agents:
+            if agent.name not in weights:
+                continue
+            try:
+                new_w = float(weights[agent.name])
+            except (TypeError, ValueError):
+                continue
+            old_w = agent.weight
+            baseline_w = type(agent).weight
+            agent.weight = new_w
+            applied[agent.name] = new_w
+            history_rows.append(AgentWeightHistory(
+                market_type=self.MARKET_TYPE,
+                agent_name=agent.name,
+                baseline_weight=baseline_w,
+                old_weight=old_w,
+                new_weight=new_w,
+                samples=(samples_map or {}).get(agent.name),
+                win_rate_when_agreed_pct=(win_rate_map or {}).get(agent.name),
+            ))
+        if applied:
+            logger.info(f"⚙ Signal Lab applied agent weights: {applied}")
+            self._log(f"⚙ Signal Lab applied agent weights: {applied}")
+            try:
+                async with AsyncSessionLocal() as session:
+                    session.add_all(history_rows)
+                    await session.commit()
+            except Exception as e:
+                logger.warning(f"⚠ Failed to persist weight-change audit rows: {type(e).__name__}: {e}")
+        return applied
     def __init__(self):
         agents = [
             MomentumAgent(),
@@ -92,6 +147,11 @@ class TradingEngine:
         self._scan_count = 0
         self._last_scan: Optional[datetime] = None
         self._status_log: list[str] = []
+        # Last portfolio balance fetched during a scan cycle — cached
+        # here purely so get_status() has something to report between
+        # scans (the executor call itself isn't cheap enough to make on
+        # every dashboard poll/WS tick, so we reuse the scan-cycle read).
+        self._last_balance_usdt: float = 0.0
 
     # ─────────────────────────────────────────
     #  Lifecycle
@@ -158,6 +218,7 @@ class TradingEngine:
 
         portfolio_usdt = await self.executor.get_usdt_balance()
         self.risk.update_portfolio_value(portfolio_usdt)
+        self._last_balance_usdt = portfolio_usdt
 
         await self._check_open_positions(portfolio_usdt)
 
@@ -429,6 +490,7 @@ class TradingEngine:
             "mode": settings.TRADING_MODE,
             "scan_count": self._scan_count,
             "last_scan": self._last_scan.isoformat() if self._last_scan else None,
+            "balance_usdt": self._last_balance_usdt,
             "risk": self.risk.summary(),
             "pairs": settings.TRADING_PAIRS,
             "log": list(reversed(self._status_log[-50:])),

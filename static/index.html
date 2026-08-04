@@ -354,18 +354,25 @@ body.futures-mode .spot-only{display:none}
 }
 .resume-btn:hover{background:var(--red);color:#fff}
 
-/* ── LEVERAGE START MODAL ── */
+/* ── MODALS (leverage start / weight apply confirmation) ── */
 .modal-overlay{
   position:fixed;inset:0;background:rgba(3,5,8,.75);backdrop-filter:blur(3px);
   display:none;align-items:center;justify-content:center;z-index:1000;
 }
 .modal-overlay.show{display:flex}
 .leverage-modal{
-  width:360px;max-width:90vw;background:var(--panel);
+  width:380px;max-width:90vw;background:var(--panel);
   border:1px solid rgba(255,149,0,.4);border-radius:14px;
   padding:24px;box-shadow:0 0 40px rgba(255,149,0,.15);
 }
+#weightApplyModalOverlay .leverage-modal{
+  border-color:rgba(0,229,255,.35);box-shadow:0 0 40px rgba(0,229,255,.12);
+}
+body.futures-mode #weightApplyModalOverlay .leverage-modal{
+  border-color:rgba(255,149,0,.4);box-shadow:0 0 40px rgba(255,149,0,.15);
+}
 .leverage-modal h3{font-family:var(--font-mono);font-size:15px;color:#ff9500;margin-bottom:4px}
+#weightApplyModalOverlay h3{color:var(--accent)}
 .modal-sub{font-size:11px;color:var(--muted);margin-bottom:18px;line-height:1.5}
 .modal-warning{
   font-size:10.5px;color:var(--yellow);background:rgba(255,214,10,.08);
@@ -386,6 +393,9 @@ body.futures-mode .spot-only{display:none}
 .sl-panel-btn{padding:6px 16px;font-size:10px;white-space:nowrap}
 .sl-weight-changed{color:var(--accent);font-weight:700}
 .sl-empty-row td{text-align:center;padding:20px;color:var(--muted);font-size:11px}
+.sl-weight-check{width:14px;height:14px;cursor:pointer;accent-color:var(--accent)}
+.weight-diff-row{display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(26,37,64,.4)}
+.weight-diff-row:last-child{border-bottom:none}
 
 /* ── RESPONSIVE ── */
 @media(max-width:1100px){
@@ -631,14 +641,37 @@ body.futures-mode .spot-only{display:none}
     <div class="panel">
       <div class="panel-header">
         <span class="panel-title">RECOMMENDED AGENT WEIGHTS</span>
-        <button class="save-btn sl-panel-btn" onclick="applySignalLabWeights()">APPLY TO LIVE ENGINE</button>
+        <div style="display:flex;gap:8px">
+          <button class="cancel-btn sl-panel-btn" onclick="toggleAllWeightChecks()">SELECT ALL/NONE</button>
+          <button class="save-btn sl-panel-btn" onclick="openApplyWeightsModal()">APPLY SELECTED</button>
+        </div>
       </div>
       <div class="panel-body trade-table-wrap" style="padding:0 8px">
         <table class="trade-table">
           <thead>
-            <tr><th>Agent</th><th>Current Weight</th><th>Samples</th><th>Win Rate (Agreed)</th><th>Avg PnL (Agreed)</th><th>Suggested Weight</th></tr>
+            <tr>
+              <th></th><th>Agent</th><th>Baseline</th><th>Current</th><th>Samples</th>
+              <th>Win Rate (Agreed)</th><th>Avg PnL (Agreed)</th><th>Suggested Weight</th><th>Δ vs Current</th>
+            </tr>
           </thead>
           <tbody id="slWeightTable"></tbody>
+        </table>
+      </div>
+      <div class="panel-body" style="padding-top:0;font-size:10px;color:var(--muted)">
+        Suggested weight is always computed from each agent's fixed baseline (class-default) weight, never from
+        whatever is currently live — so repeated applies never compound drift; the number only moves when the
+        underlying resolved data changes.
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header"><span class="panel-title">WEIGHT CHANGE HISTORY</span></div>
+      <div class="panel-body trade-table-wrap" style="padding:0 8px">
+        <table class="trade-table">
+          <thead>
+            <tr><th>Agent</th><th>Baseline</th><th>Old</th><th>New</th><th>Samples</th><th>Win Rate</th><th>Applied</th></tr>
+          </thead>
+          <tbody id="slWeightHistoryTable"></tbody>
         </table>
       </div>
     </div>
@@ -865,9 +898,25 @@ body.futures-mode .spot-only{display:none}
   </div>
 </div>
 
+<!-- ══ WEIGHT APPLY CONFIRMATION MODAL (Signal Lab) ══ -->
+<div class="modal-overlay" id="weightApplyModalOverlay">
+  <div class="leverage-modal">
+    <h3>⚙ Apply Weight Changes</h3>
+    <p class="modal-sub">Review the exact change before it's pushed to the live engine. These values are recomputed fresh on the server right now — not the values shown when this page last loaded — so this always reflects the latest resolved data. Takes effect on the next scan cycle.</p>
+    <div id="weightDiffList" style="max-height:240px;overflow-y:auto;margin-bottom:14px;font-family:var(--font-mono);font-size:11px">
+      <div style="color:var(--muted);text-align:center;padding:12px 0">Loading current recommendations…</div>
+    </div>
+    <div class="modal-warning">⚠ This changes live consensus weighting for the selected agents. Every change is logged in Weight Change History.</div>
+    <div class="modal-actions">
+      <button class="cancel-btn" onclick="closeApplyWeightsModal()">Cancel</button>
+      <button class="save-btn" onclick="confirmApplyWeights()">CONFIRM APPLY</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ══════════════════════════════════════
-//  APEX-7 Dashboard JS
+//  APEX-8 Dashboard JS
 // ══════════════════════════════════════
 let ws;
 let currentMarket = 'spot';                 // 'spot' | 'futures'
@@ -1374,7 +1423,13 @@ async function loadAgents(){
 }
 
 // ── Signal Lab ──────────────────────────
-let slRecommendedWeights = {};
+// slPendingWeightRecs holds the LAST FETCHED recommendation list, keyed
+// implicitly by array order — used only to build the checkbox table and
+// the confirmation-modal preview text. It is NEVER sent to the server;
+// the apply endpoint always recomputes fresh from live data server-side
+// and only receives the list of agent NAMES the user selected. This is
+// what prevents stale/tampered weight values from ever being applied.
+let slPendingWeightRecs = [];
 
 async function loadSignalLab(){
   const mt = slMarketType();
@@ -1438,21 +1493,101 @@ async function loadSignalLab(){
       <td class="${b.avg_pnl_usdt>=0?'pnl-pos':'pnl-neg'}">$${b.avg_pnl_usdt.toFixed(3)}</td>
     </tr>`).join('') : '<tr class="sl-empty-row"><td colspan="4">No resolved data yet</td></tr>';
 
-  slRecommendedWeights = {};
+  // Weight recommendation table — always baseline-anchored server-side
+  // (see /api/signal-lab/weight-recommendations), so "Suggested Weight"
+  // here never drifts just because Apply was clicked before; it only
+  // moves when the underlying resolved Signal Lab data changes.
+  slPendingWeightRecs = recs;
   document.getElementById('slWeightTable').innerHTML = recs.length ? recs.map(r=>{
-    slRecommendedWeights[r.agent] = r.suggested_weight;
-    const changed = Math.abs(r.suggested_weight - r.current_weight) > 0.01;
+    const changed = Math.abs(r.delta_vs_current) > 0.01;
     return `<tr>
+      <td><input type="checkbox" class="sl-weight-check" data-agent="${r.agent}" checked></td>
       <td style="font-family:var(--font-mono)">${r.agent}</td>
-      <td>${r.current_weight.toFixed(2)}</td>
+      <td>${r.baseline_weight.toFixed(3)}</td>
+      <td>${r.current_weight.toFixed(3)}</td>
       <td>${r.samples}</td>
       <td class="${r.win_rate_when_agreed_pct>=50?'pnl-pos':'pnl-neg'}">${r.win_rate_when_agreed_pct.toFixed(1)}%</td>
       <td class="${r.avg_pnl_usdt_when_agreed>=0?'pnl-pos':'pnl-neg'}">$${r.avg_pnl_usdt_when_agreed.toFixed(3)}</td>
-      <td class="${changed?'sl-weight-changed':''}">${r.suggested_weight.toFixed(2)}</td>
+      <td class="${changed?'sl-weight-changed':''}">${r.suggested_weight.toFixed(3)}</td>
+      <td class="${r.delta_vs_current>=0?'pnl-pos':'pnl-neg'}">${r.delta_vs_current>=0?'+':''}${r.delta_vs_current.toFixed(3)}</td>
     </tr>`;
-  }).join('') : '<tr class="sl-empty-row"><td colspan="6">Not enough resolved data yet — keep the engine running</td></tr>';
+  }).join('') : '<tr class="sl-empty-row"><td colspan="9">Not enough resolved data yet — keep the engine running</td></tr>';
 
+  loadWeightHistory();
   loadSignalLabOutcomes();
+}
+
+function toggleAllWeightChecks(){
+  const boxes = document.querySelectorAll('.sl-weight-check');
+  if(boxes.length===0)return;
+  const anyUnchecked = Array.from(boxes).some(b=>!b.checked);
+  boxes.forEach(b=>b.checked = anyUnchecked);
+}
+
+// ── Weight apply confirmation modal ─────
+function openApplyWeightsModal(){
+  const selected = Array.from(document.querySelectorAll('.sl-weight-check:checked')).map(b=>b.dataset.agent);
+  if(selected.length===0){
+    alert('Select at least one agent to apply (use the checkboxes in the weight table).');
+    return;
+  }
+  const recsByAgent = Object.fromEntries(slPendingWeightRecs.map(r=>[r.agent,r]));
+  const list = document.getElementById('weightDiffList');
+  list.innerHTML = selected.map(name=>{
+    const r = recsByAgent[name];
+    if(!r) return '';
+    const cls = r.delta_vs_current>=0 ? 'pnl-pos' : 'pnl-neg';
+    return `<div class="weight-diff-row">
+      <span>${name}</span>
+      <span>${r.current_weight.toFixed(3)} &rarr; <b class="${cls}">${r.suggested_weight.toFixed(3)}</b></span>
+    </div>`;
+  }).join('') || '<div style="color:var(--muted);text-align:center;padding:12px 0">No matching agents</div>';
+
+  document.getElementById('weightApplyModalOverlay').dataset.selected = JSON.stringify(selected);
+  document.getElementById('weightApplyModalOverlay').classList.add('show');
+}
+function closeApplyWeightsModal(){
+  document.getElementById('weightApplyModalOverlay').classList.remove('show');
+}
+async function confirmApplyWeights(){
+  const overlay = document.getElementById('weightApplyModalOverlay');
+  const selected = JSON.parse(overlay.dataset.selected || '[]');
+  closeApplyWeightsModal();
+  const mt = slMarketType();
+
+  // NOTE: we only ever send agent NAMES here. The server recomputes the
+  // actual suggested_weight values itself at apply-time from a fresh
+  // baseline-anchored calculation — the numbers shown in the modal above
+  // are for the user's confirmation only, never trusted as input.
+  const res = await fetch('/api/signal-lab/apply-weights', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({market_type: mt, agents: selected})
+  });
+
+  if(!res.ok){
+    const err = await res.json().catch(()=>({detail:'Unknown error'}));
+    alert(`Apply failed: ${err.detail || res.statusText}`);
+    return;
+  }
+  const data = await res.json();
+  const n = Object.keys(data.applied_weights||{}).length;
+  alert(`Applied to ${n} agent(s) on the live ${mt} engine — takes effect next scan cycle.`);
+  loadSignalLab();
+}
+
+async function loadWeightHistory(){
+  const mt = slMarketType();
+  const rows = await fetch(`/api/signal-lab/weight-history?market_type=${mt}&limit=50`).then(r=>r.json()).catch(()=>[]);
+  document.getElementById('slWeightHistoryTable').innerHTML = rows.length ? rows.map(h=>`
+    <tr>
+      <td style="font-family:var(--font-mono)">${h.agent_name}</td>
+      <td>${h.baseline_weight.toFixed(3)}</td>
+      <td>${h.old_weight.toFixed(3)}</td>
+      <td>${h.new_weight.toFixed(3)}</td>
+      <td>${h.samples!=null?h.samples:'—'}</td>
+      <td>${h.win_rate_when_agreed_pct!=null?h.win_rate_when_agreed_pct.toFixed(1)+'%':'—'}</td>
+      <td style="font-size:10px;color:var(--muted)">${h.applied_at?new Date(h.applied_at).toLocaleString():'—'}</td>
+    </tr>`).join('') : '<tr class="sl-empty-row"><td colspan="7">No weight changes applied yet</td></tr>';
 }
 
 async function loadSignalLabOutcomes(){
@@ -1476,20 +1611,6 @@ async function loadSignalLabOutcomes(){
       <td style="font-size:10px;color:var(--muted)">${o.created_at?new Date(o.created_at).toLocaleTimeString():'—'}</td>
     </tr>`;
   }).join('') : '<tr class="sl-empty-row"><td colspan="9">No candidates recorded yet</td></tr>';
-}
-
-async function applySignalLabWeights(){
-  const mt = slMarketType();
-  if(Object.keys(slRecommendedWeights).length === 0){
-    alert('No recommendations available yet — let more signals resolve first.');
-    return;
-  }
-  await fetch('/api/signal-lab/apply-weights', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({market_type: mt, weights: slRecommendedWeights})
-  });
-  alert(`Applied tuned weights to the live ${mt} engine — takes effect next scan cycle.`);
-  loadSignalLab();
 }
 
 // ── Settings ────────────────────────────
