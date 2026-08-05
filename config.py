@@ -195,7 +195,7 @@ class Settings:
 
     FUTURES_TRADING_PAIRS: list[str] = [
         p.strip().upper() for p in os.getenv(
-            "FUTURES_TRADING_PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT"
+            "FUTURES_TRADING_PAIRS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,AVAXUSDT"
         ).split(",") if p.strip()
     ]
 

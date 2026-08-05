@@ -56,6 +56,30 @@ Changes vs v3 (balance display fix):
     `balance_usdt` so the WebSocket status payload carries it to the
     frontend on every tick — mirrors the identical fix in
     trading_engine.py.
+
+Changes vs v4 (manual-close / already-flat-position fix):
+  - PROBLEM THIS FIXES: futures protective exits are TWO INDEPENDENT
+    reduce-only orders (STOP_MARKET + TAKE_PROFIT_MARKET), not a real
+    OCO. If one of them fills on the exchange (evaluated against MARK
+    PRICE, in real time), the position goes flat on Binance immediately
+    — but the local DB row still says status="OPEN" until the next
+    `_check_open_positions()` poll notices the last-traded price has
+    crossed the stored TP/SL level. In that window, a manual "Close"
+    click would: cancel the now-stale resting order (succeeds, since it
+    still exists as an order object even though the position is gone),
+    then try to place a NEW reduceOnly MARKET order against a position
+    that's already zero — which Binance correctly rejects with -2022
+    ReduceOnly Order is rejected, because reducing a flat position isn't
+    a valid reduce at all.
+  - FIX: `close_trade_manual()` now calls `get_position_risk()` (already
+    implemented on FuturesOrderExecutor, just previously unused here)
+    to read the REAL position size on the exchange before attempting to
+    close anything. If it's already flat, we reconcile the local Trade
+    row against the current price instead of firing another order that
+    would only ever be rejected. If a position genuinely remains open,
+    we close using `min(trade.quantity, live position size)` so a
+    partial-fill/rounding mismatch between our local qty and the
+    exchange's can't trigger the same rejection.
 """
 import asyncio
 import logging
@@ -161,7 +185,55 @@ class FuturesTradingEngine:
 
         await self.executor.cancel_all_orders(trade.symbol)
 
-        order = await self.executor.close_position_market(trade.symbol, trade.side, trade.quantity)
+        # ── Reconcile against the REAL exchange position before trying
+        #    to reduce it. Protective exits are two independent
+        #    reduce-only orders (no true OCO on Futures) evaluated
+        #    against mark price in real time by Binance — one of them
+        #    can fill and flatten the position before our own
+        #    _check_open_positions() poll notices via last price. In
+        #    that window a naive close attempt would fire a NEW
+        #    reduceOnly order against an already-flat position, which
+        #    Binance rejects with -2022. ──
+        live_amt = 0.0
+        try:
+            positions = await self.executor.get_position_risk(trade.symbol)
+            if positions:
+                live_amt = float(positions[0].get("positionAmt", 0.0))
+        except Exception as e:
+            logger.warning(f"⚠ Futures position risk check failed for {trade.symbol}: {type(e).__name__}: {e}")
+
+        if abs(live_amt) < 1e-9:
+            # Already flat on the exchange — TP or SL almost certainly
+            # already filled. Reconcile the local record instead of
+            # firing another order that would only ever be rejected.
+            price = await fmd.fetch_price(trade.symbol)
+            pnl_pct = (price - trade.entry_price) / trade.entry_price * 100
+            if trade.side == "SELL":
+                pnl_pct = -pnl_pct
+            leveraged_pct = pnl_pct * (trade.leverage or 1)
+            pnl_usdt = (trade.margin_usdt or 0.0) * leveraged_pct / 100
+            fee_usdt = round((trade.usdt_value or 0.0) * (settings.FUTURES_TAKER_FEE_PCT * 2 / 100), 4)
+            net_pnl_usdt = round(pnl_usdt - fee_usdt, 4)
+            net_pnl_pct = round(net_pnl_usdt / trade.margin_usdt * 100, 4) if trade.margin_usdt else leveraged_pct
+
+            await self._close_trade(trade, price, pnl_usdt, leveraged_pct, False, fee_usdt, net_pnl_usdt, net_pnl_pct)
+            self.risk.on_trade_close(trade.symbol, net_pnl_usdt, net_pnl_usdt > 0)
+
+            msg = (f"ℹ️ {trade.symbol} was already flat on the exchange (TP/SL filled before manual "
+                   f"close request arrived) — reconciled locally @ {price:.4f} "
+                   f"PnL={leveraged_pct:+.2f}% (${pnl_usdt:+.2f} gross / ${net_pnl_usdt:+.2f} net)")
+            logger.info(msg)
+            self._log(msg)
+            return {"ok": True, "trade_id": trade_id, "exit_price": price,
+                    "pnl_usdt": round(pnl_usdt, 4), "net_pnl_usdt": net_pnl_usdt,
+                    "note": "Position was already closed on the exchange (TP/SL filled) — reconciled, no new order placed."}
+
+        # Genuinely still open — close using the SMALLER of our locally
+        # recorded quantity and the live exchange size, so a rounding or
+        # partial-fill mismatch can't itself trigger another -2022.
+        close_qty = min(trade.quantity, abs(live_amt))
+
+        order = await self.executor.close_position_market(trade.symbol, trade.side, close_qty)
         if not order:
             return {"ok": False, "error": "Market close order failed — check logs / exchange"}
 
